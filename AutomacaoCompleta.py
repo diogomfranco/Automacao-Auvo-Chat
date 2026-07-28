@@ -1,8 +1,10 @@
-import pandas as pd
+﻿import pandas as pd
 import difflib
 import unicodedata
 import re
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from playwright.sync_api import sync_playwright
 from datetime import datetime,timedelta
 import threading
@@ -12,9 +14,191 @@ import pyperclip
 import os
 import time
 import ctypes
-import os
-from dotenv import load_dotenv
+from ctypes import wintypes
 
+# ---------------------------------------------------------------------------
+# Bandeja do sistema / controle do prompt
+# ---------------------------------------------------------------------------
+def _get_console_hwnd():
+    try:
+        return ctypes.windll.kernel32.GetConsoleWindow()
+    except Exception:
+        return 0
+
+def _janela_existe(hwnd):
+    return bool(hwnd and ctypes.windll.user32.IsWindow(hwnd))
+
+
+def _texto_janela(hwnd):
+    try:
+        tamanho = ctypes.windll.user32.GetWindowTextLengthW(hwnd) + 1
+        buffer = ctypes.create_unicode_buffer(tamanho)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buffer, tamanho)
+        return buffer.value
+    except Exception:
+        return ""
+
+
+def _classe_janela(hwnd):
+    try:
+        buffer = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, buffer, 256)
+        return buffer.value
+    except Exception:
+        return ""
+
+
+def _capturar_janela_prompt():
+    global _PROMPT_HWND
+
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    classe = _classe_janela(hwnd).lower()
+    titulo = _texto_janela(hwnd).lower()
+    parece_prompt = (
+        "consolewindowclass" in classe
+        or "cascadia" in classe
+        or "powershell" in titulo
+        or "prompt" in titulo
+        or "cmd" in titulo
+        or "sistema" in titulo
+        or "python" in titulo
+    )
+    if hwnd and parece_prompt:
+        _PROMPT_HWND = hwnd
+        return hwnd
+
+    _PROMPT_HWND = _get_console_hwnd()
+    return _PROMPT_HWND
+
+
+def _get_prompt_hwnd():
+    if _janela_existe(_PROMPT_HWND):
+        return _PROMPT_HWND
+    return _get_console_hwnd()
+
+
+def _mostrar_console(icon=None, item=None):
+    hwnd = _get_prompt_hwnd()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+
+
+def _ocultar_console(icon=None, item=None):
+    hwnd = _get_prompt_hwnd()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+
+
+def _alternar_console(icon=None, item=None):
+    hwnd = _get_prompt_hwnd()
+    if not hwnd:
+        return
+    if ctypes.windll.user32.IsWindowVisible(hwnd):
+        _ocultar_console()
+    else:
+        _mostrar_console()
+
+
+def _desabilitar_botao_fechar_console():
+    hwnd = _get_prompt_hwnd()
+    if not hwnd:
+        return
+    try:
+        hmenu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+        if hmenu:
+            ctypes.windll.user32.DeleteMenu(hmenu, 0xF060, 0)  # SC_CLOSE / MF_BYCOMMAND
+            ctypes.windll.user32.DrawMenuBar(hwnd)
+    except Exception:
+        pass
+
+
+def _console_esta_minimizado(hwnd):
+    if ctypes.windll.user32.IsIconic(hwnd):
+        return True
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    class WINDOWPLACEMENT(ctypes.Structure):
+        _fields_ = [
+            ("length", ctypes.c_uint),
+            ("flags", ctypes.c_uint),
+            ("showCmd", ctypes.c_uint),
+            ("ptMinPosition", POINT),
+            ("ptMaxPosition", POINT),
+            ("rcNormalPosition", RECT),
+        ]
+
+    placement = WINDOWPLACEMENT()
+    placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+    if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+        return placement.showCmd == 2  # SW_SHOWMINIMIZED
+    return False
+
+
+def _monitorar_console_minimizado():
+    while True:
+        hwnd = _get_prompt_hwnd()
+        if hwnd and ctypes.windll.user32.IsWindowVisible(hwnd) and _console_esta_minimizado(hwnd):
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+        time.sleep(0.05)
+
+
+def _criar_icone_bandeja():
+    from PIL import Image, ImageDraw, ImageFont
+
+    if os.path.exists(APP_ICON_PATH):
+        return Image.open(APP_ICON_PATH)
+
+    img = Image.new("RGBA", (64, 64), (22, 126, 191, 255))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((8, 8, 56, 56), fill=(255, 255, 255, 235))
+    draw.text((24, 19), "A", fill=(22, 126, 191, 255), font=ImageFont.load_default())
+    return img
+
+
+def _iniciar_bandeja_sistema():
+    global _TRAY_STARTED
+    if _TRAY_STARTED:
+        return
+    _TRAY_STARTED = True
+    try:
+        import pystray
+    except Exception as e:
+        _TRAY_STARTED = False
+        print(f"Aviso: bandeja do sistema indisponivel ({e}). Instale 'pystray' e 'pillow'.")
+        return
+
+    def sair(icon, item):
+        try:
+            icon.stop()
+        finally:
+            os._exit(0)
+
+    _capturar_janela_prompt()
+    _desabilitar_botao_fechar_console()
+    icon = pystray.Icon(
+        "Sistema Auvo",
+        _criar_icone_bandeja(),
+        "Sistema Auvo",
+        menu=pystray.Menu(
+            pystray.MenuItem("Mostrar/Ocultar prompt", _alternar_console, default=True),
+            pystray.MenuItem("Sair", sair),
+        ),
+    )
+    threading.Thread(target=icon.run, daemon=True).start()
+    # Monitor por polling: detecta minimização e oculta a janela imediatamente
+    threading.Thread(target=_monitorar_console_minimizado, daemon=True).start()
+    # Oculta o console 1.5s após iniciar (tempo para o usuário ver a mensagem de pronto)
+    threading.Timer(1.5, _ocultar_console).start()
+
+_PROMPT_HWND = 0
+_TRAY_STARTED = False
+APP_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sistema_auvo.ico")
 DATA_REFERENCIA_SPEAKR = None
 
 
@@ -34,24 +218,234 @@ def _data_referencia_speakr():
         return date.today()
 
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Configuração de acesso Auvo via Supabase
+# ---------------------------------------------------------------------------
+# SUPABASE_URL e SUPABASE_ANON_KEY vêm de variáveis de ambiente (arquivo .env,
+# veja .env.example). A proteção real fica a cargo da política de RLS da
+# tabela "credenciais_auvo" (só usuário autenticado lê), mas a URL/chave do
+# projeto não devem ser versionadas de qualquer forma.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv é opcional; as variáveis também podem vir do ambiente do SO
 
-USUARIO_AUVO = os.getenv("AUVO_USUARIO")
-SENHA_AUVO   = os.getenv("AUVO_SENHA")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+_PASTA_CONFIG = os.path.dirname(os.path.abspath(__file__))
+CONFIG_SUPABASE_PATH = os.environ.get(
+    "CONFIG_SUPABASE_PATH",
+    os.path.join(_PASTA_CONFIG, "config_supabase.json"),
+)
+ERRO_INICIALIZACAO_LOG = os.path.join(_PASTA_CONFIG, "erro_inicializacao.log")
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise SystemExit(
+        "❌ SUPABASE_URL e/ou SUPABASE_ANON_KEY não configurados. "
+        "Defina-os no ambiente ou em um arquivo .env (veja .env.example)."
+    )
+
+_CREDENCIAIS_AUVO_CACHE = {}
+
+
+def _falha_fatal_inicializacao(mensagem: str):
+    """Registra o erro em arquivo (o console some após alguns segundos) e encerra o programa."""
+    print(f"❌ {mensagem}")
+    try:
+        with open(ERRO_INICIALIZACAO_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now()}] {mensagem}\n")
+    except Exception:
+        pass
+    try:
+        input("\nPressione Enter para fechar...")
+    except Exception:
+        pass
+    raise SystemExit(1)
+
+
+def _carregar_config_supabase() -> dict:
+    if not os.path.exists(CONFIG_SUPABASE_PATH):
+        _falha_fatal_inicializacao(
+            f"Arquivo de configuração não encontrado: {CONFIG_SUPABASE_PATH}. "
+            "Verifique se o Iniciar_Auvo.bat sincronizou o config_supabase.json do servidor."
+        )
+    try:
+        with open(CONFIG_SUPABASE_PATH, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        if "email" not in config or "senha" not in config:
+            raise ValueError("config_supabase.json precisa conter as chaves 'email' e 'senha'.")
+        return config
+    except Exception as e:
+        _falha_fatal_inicializacao(f"Erro ao ler config_supabase.json: {e}")
+
+
+def _login_supabase(config: dict):
+    from supabase import create_client
+
+    try:
+        cliente = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    except Exception as e:
+        _falha_fatal_inicializacao(f"Não foi possível criar o cliente Supabase: {e}")
+
+    ultimo_erro = None
+    for tentativa in range(1, 4):
+        try:
+            cliente.auth.sign_in_with_password({
+                "email": config["email"],
+                "password": config["senha"],
+            })
+            return cliente
+        except Exception as e:
+            ultimo_erro = e
+            if tentativa < 3:
+                print(f"⚠️ Falha ao autenticar no Supabase ({tentativa}/3): {e}. Tentando novamente...")
+                time.sleep(3)
+    _falha_fatal_inicializacao(
+        f"Não foi possível autenticar no Supabase após 3 tentativas: {ultimo_erro}. "
+        "Verifique a internet e se a conta de automação está ativa."
+    )
+
+
+def _obter_credenciais_auvo(cliente) -> dict:
+    if _CREDENCIAIS_AUVO_CACHE:
+        return _CREDENCIAIS_AUVO_CACHE
+
+    ultimo_erro = None
+    for tentativa in range(1, 4):
+        try:
+            resp = (
+                cliente.table("credenciais_auvo")
+                .select("usuario, senha, api_key, api_token")
+                .limit(1)
+                .execute()
+            )
+            if not resp.data:
+                raise RuntimeError("Nenhuma linha encontrada na tabela credenciais_auvo.")
+            _CREDENCIAIS_AUVO_CACHE.update(resp.data[0])
+            return _CREDENCIAIS_AUVO_CACHE
+        except Exception as e:
+            ultimo_erro = e
+            if tentativa < 3:
+                print(f"⚠️ Falha ao buscar credenciais Auvo ({tentativa}/3): {e}. Tentando novamente...")
+                time.sleep(3)
+    _falha_fatal_inicializacao(
+        f"Não foi possível obter as credenciais da Auvo após 3 tentativas: {ultimo_erro}"
+    )
+
+
+_CREDENCIAL_IA_CACHE = {}
+
+
+def _obter_credencial_claude(cliente) -> str:
+    """Busca a chave da API do Claude numa tabela própria (credenciais_ia),
+    isolada da tabela de credenciais do Auvo por princípio de menor privilégio."""
+    if _CREDENCIAL_IA_CACHE.get("anthropic_api_key"):
+        return _CREDENCIAL_IA_CACHE["anthropic_api_key"]
+
+    ultimo_erro = None
+    for tentativa in range(1, 4):
+        try:
+            resp = (
+                cliente.table("credenciais_ia")
+                .select("anthropic_api_key")
+                .limit(1)
+                .execute()
+            )
+            if not resp.data:
+                raise RuntimeError("Nenhuma linha encontrada na tabela credenciais_ia.")
+            chave = (resp.data[0].get("anthropic_api_key") or "").strip()
+            if not chave:
+                raise RuntimeError("Coluna anthropic_api_key vazia na tabela credenciais_ia.")
+            _CREDENCIAL_IA_CACHE["anthropic_api_key"] = chave
+            return chave
+        except Exception as e:
+            ultimo_erro = e
+            if tentativa < 3:
+                print(f"⚠️ Falha ao buscar a chave da IA ({tentativa}/3): {e}. Tentando novamente...")
+                time.sleep(3)
+    _falha_fatal_inicializacao(
+        f"Não foi possível obter a chave da API Anthropic (tabela credenciais_ia) após 3 tentativas: {ultimo_erro}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Credencial da conta de serviço do Google (tabela credenciais_google) —
+# usada só pra gravar equipamentos não vinculados no Google Sheets.
+# Buscada sob demanda (não trava a inicialização se faltar/falhar).
+# ---------------------------------------------------------------------------
+_CREDENCIAL_GOOGLE_CACHE = {}
+
+
+def _obter_credencial_google(cliente) -> dict:
+    """Busca o JSON da conta de serviço do Google (tabela credenciais_google)
+    e devolve como dict, pronto pra usar com google-auth. Não trava a
+    inicialização se falhar — a verificação de equipamento fica indisponível,
+    mas o resto do sistema continua funcionando."""
+    if _CREDENCIAL_GOOGLE_CACHE.get("info"):
+        return _CREDENCIAL_GOOGLE_CACHE["info"]
+
+    ultimo_erro = None
+    for tentativa in range(1, 4):
+        try:
+            resp = (
+                cliente.table("credenciais_google")
+                .select("service_account_json")
+                .limit(1)
+                .execute()
+            )
+            if not resp.data:
+                raise RuntimeError("Nenhuma linha encontrada na tabela credenciais_google.")
+            bruto = (resp.data[0].get("service_account_json") or "").strip()
+            if not bruto:
+                raise RuntimeError("Coluna service_account_json vazia.")
+            info = json.loads(bruto)
+            _CREDENCIAL_GOOGLE_CACHE["info"] = info
+            return info
+        except Exception as e:
+            ultimo_erro = e
+            if tentativa < 3:
+                print(f"⚠️ Falha ao buscar credencial Google ({tentativa}/3): {e}. Tentando novamente...")
+                time.sleep(3)
+    print(f"⚠️ Não foi possível obter a credencial do Google Sheets: {ultimo_erro}. "
+          f"Verificação de equipamento não vinculado ficará desativada.")
+    return {}
+
+
+# --- CONFIGURAÇÕES DE ACESSO AUVO (buscadas do Supabase na inicialização) ---
+_config_supabase = _carregar_config_supabase()
+_supabase_client = _login_supabase(_config_supabase)
+_creds_auvo = _obter_credenciais_auvo(_supabase_client)
+
+USUARIO_AUVO   = _creds_auvo["usuario"]
+SENHA_AUVO     = _creds_auvo["senha"]
+AUVO_API_KEY   = _creds_auvo["api_key"]
+AUVO_API_TOKEN = _creds_auvo["api_token"]
+
+ANTHROPIC_API_KEY = _obter_credencial_claude(_supabase_client)
 
 user32 = ctypes.windll.user32
 largura = user32.GetSystemMetrics(78)
 altura = user32.GetSystemMetrics(79)
 
 # --- USUÁRIOS ---
-USUARIOS = {
-    "1": {"nome": "Usuario1", "id": 000000},
-    "2": {"nome": "Usuario2", "id": 000000},
-    "3": {"nome": "Usuario3", "id": 000000},
-    "4": {"nome": "Usuario4", "id": 000000},
-    "5": {"nome": "Usuario5", "id": 000000},
-    "6": {"nome": "Usuario6", "id": 000000},
-}
+# Carregado de um arquivo externo (não versionado) para não expor nomes/IDs
+# reais da equipe no código público. Veja usuarios.example.json para o formato.
+_USUARIOS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usuarios.json")
+
+
+def _carregar_usuarios() -> dict:
+    if not os.path.exists(_USUARIOS_PATH):
+        raise SystemExit(
+            f"❌ Arquivo de usuários não encontrado: {_USUARIOS_PATH}. "
+            "Copie usuarios.example.json para usuarios.json e preencha com os dados da sua equipe."
+        )
+    with open(_USUARIOS_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+USUARIOS = _carregar_usuarios()
 
 # --- SELEÇÃO DO USUÁRIO NO INÍCIO ---
 def selecionar_usuario():
@@ -72,19 +466,109 @@ def selecionar_usuario():
 USUARIO_ATUAL = selecionar_usuario()
 ID_USER       = USUARIO_ATUAL["id"]
 NOME_USER     = USUARIO_ATUAL["nome"]
+_iniciar_bandeja_sistema()
 
 
 # ---------------------------------------------------------------------------
-# Timeout para chamada do Gemini (evita travar indefinidamente)
+# Configuração da API do Claude (Anthropic)
 # ---------------------------------------------------------------------------
-GEMINI_TIMEOUT = 120  # segundos máximos aguardando resposta do Gemini
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+CLAUDE_MODEL = "claude-sonnet-5"
+CLAUDE_TIMEOUT = 60  # segundos máximos aguardando resposta do Claude
+CLAUDE_MAX_TOKENS = 2048
+
 AUVO_TOKEN_CACHE = {"token": None, "expires_at": 0}
 AUVO_TOKEN_LOCK = threading.Lock()
 AUVO_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-GEMINI_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_state.json")
+AUVO_CONNECT_TIMEOUT = 8
+AUVO_LOGIN_TIMEOUT = (AUVO_CONNECT_TIMEOUT, 25)
+AUVO_LIST_TIMEOUT = (AUVO_CONNECT_TIMEOUT, 25)
+AUVO_CONFIRM_TIMEOUT = (AUVO_CONNECT_TIMEOUT, 30)
+AUVO_CREATE_TIMEOUT = (AUVO_CONNECT_TIMEOUT, 45)
+AUVO_CONFIRM_RETRIES = 5
+AUVO_CONFIRM_BASE_WAIT = 1.5
+
 HTTP_SESSION = requests.Session()
+HTTP_SESSION.mount('https://api.auvo.com.br', HTTPAdapter(max_retries=Retry(
+    total=2,
+    connect=2,
+    read=1,
+    status=2,
+    backoff_factor=0.8,
+    status_forcelist=(500, 502, 503, 504),
+    allowed_methods=frozenset(['GET']),
+)))
 AUVO_TASKS_CACHE = {}
 AUVO_TASKS_CACHE_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets — planilha "Equipamentos não Vinculados", usada pra registrar
+# quando um equipamento citado no chat não bate com nada cadastrado pro
+# cliente na Auvo. Requer: pip install gspread google-auth --break-system-packages
+# ---------------------------------------------------------------------------
+GOOGLE_SHEET_ID = "1VVWZxkHj2OY5oMI7HW_aVAqzjM97ziDbDcVKfBcR5Us"
+GOOGLE_SHEET_ABA = "Página1"
+
+_GSPREAD_CLIENT_CACHE = {"cliente": None}
+
+
+def _montar_cliente_gspread():
+    """Monta (e cacheia) o client do gspread autenticado via conta de serviço.
+    Retorna None se a credencial não estiver disponível — quem chamar deve
+    tratar esse caso sem derrubar o fluxo de checkout."""
+    if _GSPREAD_CLIENT_CACHE["cliente"] is not None:
+        return _GSPREAD_CLIENT_CACHE["cliente"]
+
+    info = _obter_credencial_google(_supabase_client)
+    if not info:
+        return None
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        escopos = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credenciais = Credentials.from_service_account_info(info, scopes=escopos)
+        cliente_gspread = gspread.authorize(credenciais)
+        _GSPREAD_CLIENT_CACHE["cliente"] = cliente_gspread
+        return cliente_gspread
+    except Exception as e:
+        print(f"⚠️ Não foi possível autenticar no Google Sheets: {e}")
+        return None
+
+
+def gravar_equipamento_nao_vinculado(nome_cliente: str, nome_equipamento: str, task_id: str = "") -> bool:
+    """Adiciona uma linha [data/hora, técnico, cliente, equipamento, task] na planilha de equipamentos
+    não vinculados. Nunca lança exceção pro chamador — registra o erro no
+    console e retorna False, pra não travar o checkout por causa disso."""
+    try:
+        cliente_gspread = _montar_cliente_gspread()
+        if not cliente_gspread:
+            print("⚠️ Google Sheets indisponível; equipamento não vinculado não foi registrado.")
+            return False
+
+        planilha = cliente_gspread.open_by_key(GOOGLE_SHEET_ID)
+        aba = planilha.worksheet(GOOGLE_SHEET_ABA)
+        aba.append_row(
+            [
+                datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                NOME_USER or "",
+                nome_cliente or "",
+                nome_equipamento or "",
+                str(task_id or ""),
+            ],
+            value_input_option="USER_ENTERED",
+        )
+        print(f"📋 Registrado na planilha: {nome_cliente} — {nome_equipamento} — Task {task_id or '-'}")
+        return True
+    except Exception as e:
+        print(f"⚠️ Erro ao gravar equipamento não vinculado no Sheets: {e}")
+        return False
 
 
 def _todas_paginas_cdp(browser):
@@ -140,149 +624,84 @@ def _selecionar_pagina_speakr(browser):
         except Exception:
             urls.append("<url indisponivel>")
     raise Exception("Aba do Speakr nao encontrada no Chrome 9222. Abas abertas: " + " | ".join(urls[:6]))
-def chamar_gemini(prompt: str, tentativas=3) -> str:
+def chamar_claude(prompt: str, tentativas: int = 5) -> str:
+    """Chama a API do Claude (Anthropic) diretamente via HTTPS.
+
+    Substitui a antiga automação de navegador contra o Gemini: sem browser,
+    sem estado de sessão em disco, resposta em segundos e sem depender da
+    UI web do Gemini permanecer estável.
+    """
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
     for i in range(tentativas):
-        browser = None
         try:
-            print(f"🤖 Tentativa {i+1}/{tentativas}: Acessando Gemini...")
+            print(f"tentativa {i+1}/{tentativas}: chamando API do Claude...")
+            resp = requests.post(
+                ANTHROPIC_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=CLAUDE_TIMEOUT,
+            )
+        except requests.exceptions.Timeout:
+            print(f"timeout na tentativa {i+1} ({CLAUDE_TIMEOUT}s excedido).")
+            time.sleep(1.5)
+            continue
+        except requests.exceptions.RequestException as e:
+            print(f"falha de conexao na tentativa {i+1}: {e}")
+            time.sleep(1.5)
+            continue
 
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    channel="msedge",
-                    headless=False,
-                    args=[
-                        "--disable-gpu",
-                        "--no-sandbox",
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-dev-shm-usage",
-                        "--no-first-run",
-                        "--no-default-browser-check",
-                        f"--window-position={largura},{altura}",
-                    ]
-                )
-
-                context = browser.new_context(
-                    storage_state=GEMINI_STATE_PATH if os.path.exists(GEMINI_STATE_PATH) else None,
-                    viewport={"width": 1280, "height": 720},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    java_script_enabled=True,
-                )
-
-                context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US'] });
-                    window.chrome = { runtime: {} };
-                """)
-
-                page = context.new_page()
-                page.evaluate("window.resizeTo(800, 600)")
-
-                page.route("**/*", lambda route: route.abort()
-                    if route.request.resource_type in ["image", "stylesheet", "font", "media", "other"]
-                    else route.continue_())
-
-                page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60000)
-
-                if "accounts.google" in page.url or "signin" in page.url:
-                    print("⚠️ Sessão não encontrada. Faça login manualmente...")
-                    browser.close()
-                    browser = p.chromium.launch(channel="msedge", headless=False)
-                    context = browser.new_context(viewport={"width": 1920, "height": 1080})
-                    page = context.new_page()
-                    page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60000)
-                    print("Após logar, pressione ENTER...")
-                    input()
-                    context.storage_state(path=GEMINI_STATE_PATH)
-                    print("✅ Sessão salva!")
-
-                input_box = page.locator('div[contenteditable="true"]').first
-                input_box.wait_for(state="visible", timeout=30000)
-                input_box.click()
-                input_box.fill(prompt)
-                input_box.press("Enter")
-
-                print("⏳ Aguardando resposta do Gemini...")
-
-                # ── Timeout global para não travar o servidor ──────────────
-                try:
-                    page.wait_for_selector('[data-test-id*="copy"]', timeout=GEMINI_TIMEOUT * 1000)
-                except Exception:
-                    print(f"⚠️ Gemini não respondeu em {GEMINI_TIMEOUT}s. Usando fallback.")
-                    return ""
-
-                espera_descricao = "###DESCRIÇÃO###" in prompt or "###DESCRICAO###" in prompt
-
-                def resposta_tem_conteudo(texto_resp: str) -> bool:
-                    texto_limpo = re.sub(r'#+\s*DESCRI[ÇC][ÃA]O\s*#+', '###DESCRICAO###', texto_resp or '', flags=re.IGNORECASE).strip()
-                    if espera_descricao:
-                        candidato = texto_limpo.split("###DESCRICAO###")[-1].strip() if "###DESCRICAO###" in texto_limpo else texto_limpo
-                        if re.match(
-                            r'^(Histórico|Regras|Você é|Máximo|Ignore|Descreva|Sem sugestões|Comece com|NÃO mencione|Precisa ser|Deixe resumido|###)',
-                            candidato,
-                            flags=re.IGNORECASE,
-                        ):
-                            return False
-                        if re.search(r'\b(Cliente|problema|sistema|cálculo|calculo|banco de horas|atendimento|suporte|erro|dúvida|duvida)\b', candidato, flags=re.IGNORECASE):
-                            return len(candidato) >= 25
-                        return len(candidato) >= 60
-                    return len(texto_limpo.strip()) > 10
-
-                texto_anterior = ""
-                estavel = 0
-                for _ in range(max(40, int(GEMINI_TIMEOUT / 0.4))):
-                    time.sleep(0.4)
-                    try:
-                        texto_atual = page.locator('model-response').last.inner_text()
-                        tem_conteudo = resposta_tem_conteudo(texto_atual)
-                        if texto_atual == texto_anterior and tem_conteudo:
-                            estavel += 1
-                            if estavel >= 3:
-                                print(f"✅ Resposta estabilizou! ({len(texto_atual)} chars)")
-                                break
-                        else:
-                            estavel = 0
-                            status = "conteúdo pronto" if tem_conteudo else "aguardando descrição"
-                            print(f"⏳ Gerando... ({len(texto_atual)} chars, {status})")
-                        texto_anterior = texto_atual
-                    except Exception:
-                        pass
-                else:
-                    print(f"⚠️ Gemini não finalizou conteúdo útil em {GEMINI_TIMEOUT}s. Usando fallback.")
-                    return ""
-                ultimo_botao = page.locator('[data-test-id*="copy"]').last
-                ultimo_botao.scroll_into_view_if_needed()
-                ultimo_botao.wait_for(state="visible", timeout=5000)
-                ultimo_botao.click(force=True)
-                resposta = ""
-                for _ in range(10):
-                    time.sleep(0.1)
-                    resposta = pyperclip.paste()
-                    if resposta and len(resposta.strip()) >= 10:
-                        break
-
-                if not resposta or len(resposta.strip()) < 10:
-                    print(f"⚠️ Tentativa {i+1}: Resposta vazia.")
-                    continue
-
-                context.storage_state(path=GEMINI_STATE_PATH)
-                print(f"✅ Gemini OK ({len(resposta.strip())} chars)")
-                return resposta.strip()
-
-        except Exception as e:
-            print(f"⚠️ Tentativa {i+1} falhou: {e}")
+        if resp.status_code == 200:
             try:
-                page.screenshot(path=f"erro_gemini_tentativa_{i+1}.png")
-            except Exception:
-                pass
-            time.sleep(0.8)
+                dados = resp.json()
+                texto = "".join(
+                    bloco.get("text", "")
+                    for bloco in dados.get("content", [])
+                    if bloco.get("type") == "text"
+                ).strip()
+            except Exception as e:
+                print(f"resposta da API em formato inesperado ({e}).")
+                dados = {}
+                texto = ""
 
-        finally:
-            if browser:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+            if texto:
+                stop_reason = dados.get("stop_reason", "")
+                if stop_reason == "max_tokens":
+                    print(f"⚠️ Claude cortou a resposta por limite de tokens (stop_reason=max_tokens). Aumentar CLAUDE_MAX_TOKENS pode resolver.")
+                print(f"Claude OK ({len(texto)} chars)")
+                return texto
+            stop_reason = dados.get("stop_reason", "desconhecido") if isinstance(dados, dict) else "desconhecido"
+            print(
+                f"tentativa {i+1}: resposta vazia da API (stop_reason={stop_reason}). "
+                f"JSON bruto (amostra): {json.dumps(dados, ensure_ascii=False)[:300]!r}"
+            )
+
+        elif resp.status_code == 401:
+            print("chave da API do Claude invalida, revogada ou expirada. Verifique a coluna anthropic_api_key no Supabase. Abortando tentativas.")
+            break  # nao adianta insistir com uma chave invalida
+
+        elif resp.status_code == 429:
+            espera = 5 * (i + 1)
+            print(f"tentativa {i+1}: limite de requisicoes (429) atingido. Aguardando {espera}s...")
+            time.sleep(espera)
+            continue
+
+        elif resp.status_code >= 500:
+            print(f"tentativa {i+1}: erro no servidor da Anthropic ({resp.status_code}). Tentando novamente...")
+
+        else:
+            print(f"tentativa {i+1}: erro HTTP {resp.status_code} - {resp.text[:200]}")
+
+        time.sleep(1.5)
 
     return ""  # Retorna vazio para que o caller use o fallback adequado
 
@@ -302,6 +721,57 @@ def extrair_nome_cliente(mensagens: list[str], nome_tecnico: str = None) -> str 
                 continue
             return nome
     return None
+
+
+def anexar_sistema_descricao(descricao: str, sistema: str = None) -> str:
+    sistema = re.sub(r"\s+", " ", str(sistema or "")).strip(" -–|,.;")
+    if not sistema:
+        return descricao
+    info = f"Sistema utilizado pela cliente: {sistema}."
+    descricao = (descricao or DESCRICAO_FALLBACK).strip()
+    if info.lower() in descricao.lower():
+        return descricao
+    return f"{descricao.rstrip()} {info}"[:500]
+
+
+
+def ultima_mensagem_indica_inatividade(mensagens: list[str]) -> bool:
+    if not mensagens:
+        return False
+    marcador = re.compile(r"^\s*(?:hoje|ontem|\d{1,2}[/\-]\d{1,2})?\s*-?\s*\d{1,2}[h:]\d{2}\s*-\s*.*?(?:disse|diz):\s*", re.IGNORECASE)
+    for msg in reversed(mensagens):
+        texto = marcador.sub("", str(msg or "")).strip().lower()
+        texto = re.sub(r"\s+", " ", texto)
+        if texto:
+            return "inatividade" in texto
+    return False
+
+
+def anexar_finalizacao_inatividade(relato: str, mensagens: list[str]) -> str:
+    frase = "Atendimento finalizado por inatividade."
+    relato = (relato or RELATO_FALLBACK).strip()
+    if ultima_mensagem_indica_inatividade(mensagens) and frase.lower() not in relato.lower():
+        relato = f"{relato.rstrip('.')} . {frase}"
+        relato = relato.replace(" .", ".")
+    return relato
+
+
+def inserir_linha_equipamento(relato: str, nome_equipamento: str, problema_equipamento: str = "") -> str:
+    """Garante que o relato tenha a linha 'Equipamento relatado: <nome>. Problema: <problema>.'
+    Usado quando o atendente seleciona o equipamento manualmente (fluxo do
+    modal), já que nesse caso a IA não tinha citado equipamento nenhum."""
+    relato = (relato or RELATO_FALLBACK).strip()
+    if not nome_equipamento or "equipamento relatado:" in relato.lower():
+        return relato
+
+    linha = f"Equipamento relatado: {nome_equipamento}."
+
+    frase_inatividade = "Atendimento finalizado por inatividade."
+    if relato.lower().endswith(frase_inatividade.lower()):
+        base = relato[: -len(frase_inatividade)].rstrip()
+        return f"{base} {linha} {frase_inatividade}"
+
+    return f"{relato.rstrip()} {linha}"
 
 
 def gerar_descricao_fallback_mensagens(mensagens: list[str] = None) -> str:
@@ -331,11 +801,46 @@ def gerar_descricao_fallback_mensagens(mensagens: list[str] = None) -> str:
         return f"Cliente relata: {texto}." if not texto.endswith(".") else f"Cliente relata: {texto}"
 
     return DESCRICAO_FALLBACK if "DESCRICAO_FALLBACK" in globals() else "Cliente entrou em contato via chat."
-def pegar_descricao(texto, mensagens: list[str] = None):
+def limpar_prefixo_gemini(texto: str) -> str:
+    texto = str(texto or "").strip()
     if not texto:
-        return "Cliente entrou em contato via chat."
+        return ""
+    nucleo_gemini = r'(?:Gemini\s+(?:disse|respondeu)|Resposta\s+do\s+Gemini)\s*[:\-\u2013]?\s*'
+    # 1) "Foi o Gemini disse X" ou "Foi Gemini disse X" -> remove tudo, incluindo o "Foi"
+    #    (o "Foi" pertencia ao artefato do Gemini, não ao texto real)
+    texto = re.sub(r'^\s*Foi\s+(?:o\s+)?' + nucleo_gemini, '', texto, flags=re.IGNORECASE)
+    # 2) "Gemini disse X" no inicio -> remove
+    texto = re.sub(r'^\s*' + nucleo_gemini, '', texto, flags=re.IGNORECASE)
+    # 3) ocorrencias no meio/fim da frase ("Solene precisa Gemini disse atualizar")
+    texto = re.sub(r'\s+' + nucleo_gemini, ' ', texto, flags=re.IGNORECASE)
+    # 4) apos pontuacao: ". Gemini disse X" -> ". X"
+    texto = re.sub(r'(?<=[.!?])\s*' + nucleo_gemini, ' ', texto, flags=re.IGNORECASE)
+    return re.sub(r'\s{2,}', ' ', texto).strip()
+
+def texto_placeholder_ia(texto: str) -> bool:
+    texto = re.sub(r"\s+", " ", str(texto or "")).strip().strip('"').strip("'")
+    texto_sem_pontos = texto.replace(".", "").replace("…", "").strip()
+    if not texto or not texto_sem_pontos:
+        return True
+    return bool(re.fullmatch(
+        r"(?:\.\.\.|…|texto(?: real)?(?: d[ao] .*)?|descri[cç][aã]o|relato|exemplo|preencher|n/?a|não informado|nao informado|sem informa[cç][aã]o)",
+        texto,
+        flags=re.IGNORECASE,
+    ))
+
+
+def pegar_descricao(texto, mensagens: list[str] = None):
+    if not texto or texto_placeholder_ia(texto):
+        return gerar_descricao_fallback_mensagens(mensagens)
 
     texto = re.sub(r'Format:\s*Plain\s*text\.?', '', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bMonday\b', 'segunda-feira', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bTuesday\b', 'terça-feira', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bWednesday\b', 'quarta-feira', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bThursday\b', 'quinta-feira', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bFriday\b', 'sexta-feira', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bSaturday\b', 'sábado', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bSunday\b', 'domingo', texto, flags=re.IGNORECASE)
     texto = re.sub(r'#+\s*DESCRI[ÇC][ÃA]O\s*#+', '###DESCRICAO###', texto, flags=re.IGNORECASE)
 
     if "###DESCRICAO###" in texto:
@@ -351,9 +856,18 @@ def pegar_descricao(texto, mensagens: list[str] = None):
             print("⚠️ Gemini retornou apenas o marcador da descrição. Usando fallback do histórico.")
             return gerar_descricao_fallback_mensagens(mensagens)
 
-    if re.search(r'^\s*(Você é|Regras:|Histórico:)', texto, flags=re.IGNORECASE | re.MULTILINE):
+    if texto_eco_prompt(texto) or re.search(r'^\s*(Você é|Regras:|Histórico:)', texto, flags=re.IGNORECASE | re.MULTILINE):
         print("⚠️ Gemini retornou parte do prompt em vez da descrição. Usando fallback do histórico.")
         return gerar_descricao_fallback_mensagens(mensagens)
+
+    # Remove preâmbulos do tipo "Gemini disse", "Aqui está:", etc.
+    texto = re.sub(
+        r'^.*?\b(?:disse|diz)[:\s]+',
+        '',
+        texto,
+        flags=re.IGNORECASE | re.DOTALL,
+        count=1,
+    ).strip()
 
     if mensagens:
         nome = extrair_nome_cliente(mensagens)
@@ -382,7 +896,7 @@ def pegar_descricao(texto, mensagens: list[str] = None):
     descricao = re.sub(r'#+\s*DESCRI[ÇC][ÃA]O\s*#+', '', descricao, flags=re.IGNORECASE).strip()
     descricao = descricao.replace('\n', ' ').strip()
 
-    if not descricao or descricao in {".", ":"}:
+    if not descricao or texto_placeholder_ia(descricao) or descricao in {".", ":"}:
         print("⚠️ Descrição inválida após limpeza. Usando fallback do histórico.")
         return gerar_descricao_fallback_mensagens(mensagens)
 
@@ -412,27 +926,62 @@ def pegar_descricao(texto, mensagens: list[str] = None):
 # ---------------------------------------------------------------------------
 # Limpeza de relato
 # ---------------------------------------------------------------------------
-def limpar_relato(texto: str) -> str:
+def texto_eco_prompt(texto: str) -> bool:
+    """Detecta quando o Gemini (ou a captura do clipboard) devolveu o próprio
+    prompt/instruções em vez de uma resposta real."""
+    texto = (texto or "").strip()
     if not texto:
+        return False
+    if re.search(
+        r'^\s*(Você é|Voce e|Regras:|Histórico:|Historico:|Escreva em português|'
+        r'Exemplos CORRETOS|Exemplos ERRADOS|Responda SOMENTE em JSON)',
+        texto,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    if re.search(r'\bExemplos CORRETOS\b.{0,40}\bExemplos ERRADOS\b', texto, flags=re.IGNORECASE | re.DOTALL):
+        return True
+    # Marcadores exclusivos dos prompts internos: nunca apareceriam numa resposta real
+    marcadores_unicos = (
+        "<<<HISTORICO>>>", "<<<FIM_HISTORICO>>>",
+        "preparando dois textos para registrar um atendimento",
+        "texto real da descrição", "texto real do relato",
+        "Regras para \"descricao\"", "Regras para \"relato\"",
+    )
+    texto_lower = texto.lower()
+    if any(marcador.lower() in texto_lower for marcador in marcadores_unicos):
+        return True
+    return False
+
+
+def limpar_relato(texto: str) -> str:
+    if not texto or texto_placeholder_ia(texto):
         return "Foi realizado atendimento via chat."
 
-    texto = re.sub(r'\*+', '', texto)
-    texto = re.sub(r'Draft\s*\d+[\.\:]?', '', texto, flags=re.IGNORECASE)
-    texto = re.sub(r'Relato\s*\d*[\:\.]?', '', texto, flags=re.IGNORECASE)
-    texto = re.sub(r'\([\d\s\w]+caracteres?\)', '', texto, flags=re.IGNORECASE)
-    texto = re.sub(r'Format:\s*Plain\s*text\.?', '', texto, flags=re.IGNORECASE)
-    texto = re.sub(r'^[\-\•\s]+', '', texto, flags=re.MULTILINE)
+    if texto_eco_prompt(texto):
+        print("⚠️ Gemini retornou o próprio prompt em vez do relato. Usando fallback.")
+        return "Foi realizado atendimento via chat."
 
-    texto = ' '.join(linha.strip() for linha in texto.splitlines() if linha.strip())
-    texto = re.sub(r'\s{2,}', ' ', texto).strip()
+    # Remove preâmbulos do tipo "O Gemini disse", "Aqui está o relato:", etc.
+    texto = re.sub(
+        r'^.*?(?:disse[:\s]+|(?:aqui\s+(?:está|esta)\s+(?:o|um)\s+)?relato[:\s]+)',
+        '',
+        texto,
+        flags=re.IGNORECASE | re.DOTALL,
+        count=1,
+    ).strip()
 
-    if texto and not texto.endswith('.'):
-        texto += '.'
+    # Se ainda restar lixo antes do "Foi", descarta tudo antes dele
+    match = re.search(r'\bFoi\b', texto, re.IGNORECASE)
+    if match and match.start() > 0:
+        texto = texto[match.start():]
 
-    if texto and not texto.lower().startswith('foi'):
-        texto = 'Foi ' + texto[0].lower() + texto[1:]
+    # Remove a linha/frase "Problema: ..." que a IA às vezes escreve dentro
+    # do próprio relato (esse dado já vem separado no campo
+    # problema_equipamento e não deve aparecer duplicado no texto do relato).
+    texto = re.sub(r'\s*Problema:\s*[^.\n]*\.?', '', texto, flags=re.IGNORECASE).strip()
 
-    return texto[:800]
+    return texto.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -460,81 +1009,310 @@ def preprocessar_mensagens(mensagens: list[str]) -> str:
 DESCRICAO_FALLBACK = "Cliente entrou em contato via chat para atendimento."
 RELATO_FALLBACK    = "Foi realizado atendimento via chat."
 
-def gerar_descricao_com_ia(mensagens: list[str]) -> str:
+_PROMPTS_IA_CACHE = {}
+
+
+def _obter_prompts_ia(cliente) -> dict:
+    """Busca os textos dos prompts (descricao/relato/combinado) na tabela
+    prompts_ia do Supabase. Se a tabela/linha não existir ou a busca falhar,
+    usa os prompts padrão embutidos no código — nunca trava a inicialização
+    por causa disso, já que não é um dado sensível como a API key."""
+    if _PROMPTS_IA_CACHE:
+        return _PROMPTS_IA_CACHE
+
+    try:
+        resp = cliente.table("prompts_ia").select("chave, texto").execute()
+        for linha in resp.data or []:
+            chave = (linha.get("chave") or "").strip()
+            texto = linha.get("texto") or ""
+            if chave and texto.strip():
+                _PROMPTS_IA_CACHE[chave] = texto
+        if _PROMPTS_IA_CACHE:
+            print(f"✅ Prompts carregados do Supabase: {', '.join(_PROMPTS_IA_CACHE.keys())}")
+    except Exception as e:
+        print(f"⚠️ Não foi possível buscar prompts_ia no Supabase, usando prompts padrão do código: {e}")
+
+    return _PROMPTS_IA_CACHE
+
+
+# Carrega os prompts do Supabase assim que possível na inicialização
+# (definido aqui, mas _supabase_client já existe desde o topo do módulo).
+_obter_prompts_ia(_supabase_client)
+
+
+def _prompt_descricao(linhas: str) -> str:
+    """O texto do prompt vem da tabela prompts_ia (chave 'descricao') no
+    Supabase — não há mais fallback embutido no código."""
+    template = _PROMPTS_IA_CACHE.get("descricao")
+    if not template:
+        raise RuntimeError(
+            "Prompt 'descricao' não encontrado na tabela prompts_ia do Supabase. "
+            "Cadastre a linha (chave='descricao') antes de gerar descrições."
+        )
+    return template.replace("@@HISTORICO@@", linhas)
+
+
+def _prompt_relato(linhas: str) -> str:
+    """O texto do prompt vem da tabela prompts_ia (chave 'relato') no
+    Supabase — inclui as regras de equipamento_relacionado/equipamento_citado/
+    problema_equipamento em JSON. Não há mais fallback embutido no código."""
+    template = _PROMPTS_IA_CACHE.get("relato")
+    if not template:
+        raise RuntimeError(
+            "Prompt 'relato' não encontrado na tabela prompts_ia do Supabase. "
+            "Cadastre a linha (chave='relato') antes de gerar relatos."
+        )
+    return _injetar_keywords_equipamentos_prompt(template.replace("@@HISTORICO@@", linhas))
+
+
+def _prompt_combinado(linhas: str) -> str:
+    """O texto do prompt vem da tabela prompts_ia (chave 'combinado') no
+    Supabase — inclui os campos equipamento_relacionado/equipamento_citado/
+    problema_equipamento em JSON. Não há mais fallback embutido no código."""
+    template = _PROMPTS_IA_CACHE.get("combinado")
+    if not template:
+        raise RuntimeError(
+            "Prompt 'combinado' não encontrado na tabela prompts_ia do Supabase. "
+            "Cadastre a linha (chave='combinado') antes de usar o fluxo combinado."
+        )
+    return _injetar_keywords_equipamentos_prompt(template.replace("@@HISTORICO@@", linhas))
+
+
+def _bool_ia(valor) -> bool:
+    if isinstance(valor, bool):
+        return valor
+    if isinstance(valor, (int, float)):
+        return bool(valor)
+    if isinstance(valor, str):
+        texto = valor.strip().lower()
+        if texto in {"true", "1", "sim", "s", "yes", "y"}:
+            return True
+        if texto in {"false", "0", "nao", "não", "n", "no", ""}:
+            return False
+    return False
+
+
+def _injetar_keywords_equipamentos_prompt(prompt: str) -> str:
+    apelidos = _obter_equipamentos_keywords(_supabase_client)
+    if not apelidos:
+        return prompt
+
+    linhas = [
+        "Use tambem estes apelidos de equipamentos para identificar equipamento_relacionado e equipamento_citado:",
+        *[f"- {apelido} -> {oficial}" for apelido, oficial in sorted(apelidos.items())],
+    ]
+    bloco = "\n".join(linhas)
+    if "@@EQUIPAMENTOS_KEYWORDS@@" in prompt:
+        return prompt.replace("@@EQUIPAMENTOS_KEYWORDS@@", bloco)
+    return f"{prompt}\n\n{bloco}"
+
+
+def gerar_descricao_com_ia(mensagens: list[str], sistema: str = None) -> str:
     if not mensagens:
-        return DESCRICAO_FALLBACK
+        return anexar_sistema_descricao(DESCRICAO_FALLBACK, sistema)
 
     linhas = preprocessar_mensagens(mensagens)
+    prompt = _prompt_descricao(linhas)
 
-    prompt = f"""Você é um técnico de suporte de TI resumindo um atendimento para registro interno.
-
-Regras:
-- Máximo 350 caracteres
-- Ignore COMPLETAMENTE todas as mensagens marcadas como [TÉCNICO]
-- Descreva APENAS o problema(s) do cliente, não inclua o que precisa fazer.
-- Sem sugestões, causas, rascunhos, análise ou asteriscos
-- Comece com o nome do cliente (primeira palavra da primeira mensagem [CLIENTE] que contenha um nome)
-- NÃO mencione o técnico, AnyDesk, acesso remoto ou ações do suporte
-- Precisa ser em português.
-- Não precisa ser tão formal, faça como se tivesse descrevendo pra uma pessoa.
-- Deixe resumido, no máximo duas linhas.
-
-Histórico:
-\"\"\"
-{linhas}
-\"\"\"
-
-###DESCRIÇÃO###"""
-
-    resultado = chamar_gemini(prompt)
+    resultado = chamar_claude(prompt)
     if not resultado:
-        print("⚠️ Gemini sem resposta para descrição. Usando fallback.")
-        return DESCRICAO_FALLBACK
+        print("⚠️ Claude sem resposta para descrição. Usando fallback.")
+        return anexar_sistema_descricao(DESCRICAO_FALLBACK, sistema)
 
-    return pegar_descricao(resultado, mensagens)
+    return anexar_sistema_descricao(pegar_descricao(resultado, mensagens), sistema)
 
 
 # ---------------------------------------------------------------------------
 # Geração de relato detalhado
 # ---------------------------------------------------------------------------
-def gerar_relato_com_ia(mensagens: list[str]) -> str:
+def gerar_relato_estruturado_com_ia(mensagens: list[str]) -> tuple[str, bool, str, str]:
+    """Retorna (relato, equipamento_relacionado, equipamento_citado, problema_equipamento)."""
     if not mensagens:
-        return RELATO_FALLBACK
+        relato = anexar_finalizacao_inatividade(RELATO_FALLBACK, mensagens)
+        return relato, False, "", ""
 
     linhas = preprocessar_mensagens(mensagens)
+    prompt = _prompt_relato(linhas)
 
-    prompt = f"""Você é um técnico de suporte de TI escrevendo o relato final de um atendimento para registro interno.
-
-Escreva em português informal mas profissional — como um técnico contando o que fez pra um colega de trabalho.
-
-Exemplos CORRETOS:
-- "Foi explicado pro cliente como cadastrar funcionário no sistema RM, mostrando o passo a passo dos campos obrigatórios. Também foi acessado o computador via AnyDesk pra conferir uma configuração que tava errada. Problema resolvido."
-- "Foi acessado o computador do cliente via AnyDesk. Identificado que as digitais do João e da Maria tavam corrompidas no relógio Henry. Apagado e recadastrado as digitais dos dois. Teste feito com sucesso."
-
-Exemplos ERRADOS (nunca faça isso):
-- "O cliente relatou que os funcionários não conseguiam registrar o ponto." (descreve o problema, não a ação)
-- "Foi solicitado acesso ao servidor para verificar o problema." (vago, sem resultado)
-
-Regras:
-- Comece com "Foi"
-- Fale só o que o técnico FEZ, não o problema do cliente
-- Inclua o que foi feito, como foi feito e o resultado
-- Remova parte relacionadas a acesso por Anydesk
-- Máximo 600 caracteres
-
-Histórico:
-\"\"\"
-{linhas}
-\"\"\"
-
-Relato:"""
-
-    resultado = chamar_gemini(prompt)
+    resultado = chamar_claude(prompt)
     if not resultado:
-        print("⚠️ Gemini sem resposta para relato. Usando fallback.")
-        return RELATO_FALLBACK
+        print("⚠️ Claude sem resposta para relato. Usando fallback.")
+        relato = anexar_finalizacao_inatividade(RELATO_FALLBACK, mensagens)
+        return relato, False, "", ""
 
-    return limpar_relato(resultado)
+    dados = _extrair_json_gemini(resultado)
+    relato_bruto = (dados.get("relato") or "").strip()
+    equipamento_relacionado = _bool_ia(dados.get("equipamento_relacionado"))
+    equipamento_citado = (dados.get("equipamento_citado") or "").strip()
+    problema_equipamento = (dados.get("problema_equipamento") or "").strip()
+
+    if not relato_bruto or texto_placeholder_ia(relato_bruto):
+        # fallback: se a IA não devolveu JSON, tenta tratar a resposta bruta
+        # como texto puro (compatibilidade com prompt customizado no Supabase)
+        relato_bruto = resultado if not texto_eco_prompt(resultado) else RELATO_FALLBACK
+        equipamento_relacionado = False
+        equipamento_citado = ""
+        problema_equipamento = ""
+
+    relato = anexar_finalizacao_inatividade(limpar_relato(relato_bruto), mensagens)
+    return relato, equipamento_relacionado, equipamento_citado, problema_equipamento
+
+
+def gerar_relato_com_ia(mensagens: list[str]) -> str:
+    """Mantida por compatibilidade com chamadas existentes que só querem o
+    texto do relato. Chamadas novas no checkout devem usar
+    gerar_relato_estruturado_com_ia diretamente, pra ter acesso também aos
+    campos de equipamento."""
+    relato, _, _, _ = gerar_relato_estruturado_com_ia(mensagens)
+    return relato
+
+
+def _encontrar_objetos_json_balanceados(texto: str):
+    """Varre o texto e retorna todas as substrings que formam objetos JSON
+    com chaves balanceadas, ignorando chaves que estejam dentro de strings."""
+    objetos = []
+    profundidade = 0
+    inicio = None
+    dentro_string = False
+    escapando = False
+    for i, ch in enumerate(texto):
+        if dentro_string:
+            if escapando:
+                escapando = False
+            elif ch == "\\":
+                escapando = True
+            elif ch == '"':
+                dentro_string = False
+            continue
+        if ch == '"':
+            dentro_string = True
+            continue
+        if ch == "{":
+            if profundidade == 0:
+                inicio = i
+            profundidade += 1
+        elif ch == "}":
+            if profundidade > 0:
+                profundidade -= 1
+                if profundidade == 0 and inicio is not None:
+                    objetos.append(texto[inicio:i + 1])
+                    inicio = None
+    return objetos
+
+
+def _extrair_campos_json_via_regex(texto: str) -> dict:
+    """Último recurso: extrai campos direto do texto bruto,
+    mesmo que o JSON ao redor esteja malformado (aspas quebradas, texto extra etc.)."""
+    dados = {}
+    for chave in ("descricao", "relato", "equipamento_citado", "problema_equipamento"):
+        m = re.search(rf'"{chave}"\s*:\s*"((?:[^"\\]|\\.)*)"', texto, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            valor = m.group(1)
+            try:
+                valor = json.loads(f'"{valor}"')
+            except Exception:
+                valor = valor.replace('\\"', '"').replace("\\n", " ")
+            dados[chave] = valor
+            
+    m_bool = re.search(r'"equipamento_relacionado"\s*:\s*(true|false)', texto, flags=re.IGNORECASE)
+    if m_bool:
+        dados["equipamento_relacionado"] = m_bool.group(1).lower() == "true"
+        
+    if not dados.get("equipamento_citado"):
+        m_eq = re.search(r'Equipamento relatado:\s*([^.\n]*)', texto, flags=re.IGNORECASE)
+        if m_eq:
+            dados["equipamento_citado"] = m_eq.group(1).strip()
+            dados["equipamento_relacionado"] = True
+            
+    if not dados.get("problema_equipamento"):
+        m_prob = re.search(r'Problema:\s*([^\n]*)', texto, flags=re.IGNORECASE)
+        if m_prob:
+            dados["problema_equipamento"] = m_prob.group(1).strip()
+            
+    return dados
+
+
+
+def _extrair_json_gemini(texto: str):
+    texto_original = (texto or "").strip()
+    if not texto_original:
+        return {}
+    texto = re.sub(r"^```(?:json)?\s*|\s*```$", "", texto_original, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    candidatos = [texto]
+    # Tenta todos os objetos JSON balanceados encontrados no texto (do maior pro menor),
+    # pois pode haver texto explicativo antes/depois ou chaves soltas em exemplos.
+    objetos = sorted(_encontrar_objetos_json_balanceados(texto), key=len, reverse=True)
+    candidatos.extend(objetos)
+    # Fallback simples (comportamento anterior)
+    ini = texto.find("{")
+    fim = texto.rfind("}")
+    if ini != -1 and fim != -1 and fim > ini:
+        candidatos.append(texto[ini:fim + 1])
+
+    melhor_placeholder = None
+    for candidato in candidatos:
+        try:
+            dados = json.loads(candidato)
+            if isinstance(dados, dict) and (dados.get("descricao") or dados.get("relato")):
+                descricao_tmp = (dados.get("descricao") or "").strip()
+                relato_tmp = (dados.get("relato") or "").strip()
+                if not texto_placeholder_ia(descricao_tmp) and not texto_placeholder_ia(relato_tmp):
+                    return dados
+                melhor_placeholder = melhor_placeholder or dados
+        except Exception:
+            continue
+
+    if melhor_placeholder:
+        return melhor_placeholder
+    # Último recurso: regex direto nas chaves, mesmo com JSON malformado ao redor
+    dados_regex = _extrair_campos_json_via_regex(texto)
+    if dados_regex:
+        print("⚠️ JSON da IA malformado; campos extraídos via regex de recuperação.")
+        return dados_regex
+
+    print(f"⚠️ Não foi possível extrair JSON da resposta da IA. Amostra: {texto_original[:300]!r}")
+    return {}
+
+
+def gerar_descricao_e_relato_com_ia(mensagens: list[str], sistema: str = None):
+    """Retorna (descricao, relato, equipamento_relacionado, equipamento_citado, problema_equipamento).
+    ATENÇÃO: antes retornava só (descricao, relato) — todo ponto de chamada
+    precisa desempacotar os 5 valores agora."""
+    if not mensagens:
+        descricao = anexar_sistema_descricao(DESCRICAO_FALLBACK, sistema)
+        relato = anexar_finalizacao_inatividade(RELATO_FALLBACK, mensagens)
+        return descricao, relato, False, "", ""
+
+    linhas = preprocessar_mensagens(mensagens)
+    prompt = _prompt_combinado(linhas)
+
+    resultado = chamar_claude(prompt)
+    dados = _extrair_json_gemini(resultado)
+
+    if resultado and texto_eco_prompt(resultado) and not dados:
+        print(f"⚠️ Claude ecoou o próprio prompt em vez do JSON. Amostra: {resultado[:300]!r}")
+        resultado = ""
+
+    descricao = (dados.get("descricao") or "").strip()
+    relato = (dados.get("relato") or "").strip()
+    equipamento_relacionado = _bool_ia(dados.get("equipamento_relacionado"))
+    equipamento_citado = (dados.get("equipamento_citado") or "").strip()
+    problema_equipamento = (dados.get("problema_equipamento") or "").strip()
+
+    if not descricao or texto_placeholder_ia(descricao):
+        print("⚠️ Gemini não retornou descrição válida no JSON combinado. Usando fallback.")
+        descricao = gerar_descricao_fallback_mensagens(mensagens)
+    if not relato or texto_placeholder_ia(relato):
+        print("⚠️ Gemini não retornou relato válido no JSON combinado. Usando fallback.")
+        relato = RELATO_FALLBACK
+        equipamento_relacionado = False
+        equipamento_citado = ""
+        problema_equipamento = ""
+
+    descricao = anexar_sistema_descricao(pegar_descricao(descricao, mensagens), sistema)
+    relato = anexar_finalizacao_inatividade(limpar_relato(relato), mensagens)
+    return descricao, relato, equipamento_relacionado, equipamento_citado, problema_equipamento
 
 
 # ---------------------------------------------------------------------------
@@ -1332,19 +2110,46 @@ def autenticar():
 
     url     = "https://api.auvo.com.br/v2/login/"
     payload = {
-        "apiKey":   "",
-        "apiToken": ""
+        "apiKey":   AUVO_API_KEY,
+        "apiToken": AUVO_API_TOKEN,
     }
-    response = HTTP_SESSION.post(url, json=payload, timeout=15)
-    response.raise_for_status()
-    token = response.json()["result"]["accessToken"]
+    ultimo_erro = None
+    for tentativa in range(1, 5):
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers={"Connection": "close"},
+                timeout=AUVO_LOGIN_TIMEOUT,
+            )
+            if response.status_code in (500, 502, 503, 504):
+                raise Exception(f"HTTP {response.status_code}: Auvo instável no login")
+            response.raise_for_status()
+            token = response.json()["result"]["accessToken"]
 
-    with AUVO_TOKEN_LOCK:
-        AUVO_TOKEN_CACHE["token"] = token
-        AUVO_TOKEN_CACHE["expires_at"] = time.time() + 50 * 60
+            with AUVO_TOKEN_LOCK:
+                AUVO_TOKEN_CACHE["token"] = token
+                AUVO_TOKEN_CACHE["expires_at"] = time.time() + 50 * 60
 
-    return token
+            return token
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            ultimo_erro = e
+            if tentativa < 4:
+                espera = tentativa * 2
+                print(f"⚠️ Login Auvo falhou ({tentativa}/4): {e}. Aguardando {espera}s...")
+                time.sleep(espera)
+            else:
+                raise
+        except Exception as e:
+            ultimo_erro = e
+            if tentativa < 4 and detectar_instabilidade_auvo(e):
+                espera = tentativa * 2
+                print(f"⚠️ Login Auvo instável ({tentativa}/4): {e}. Aguardando {espera}s...")
+                time.sleep(espera)
+            else:
+                raise
 
+    raise ultimo_erro or Exception("Falha desconhecida ao autenticar no Auvo")
 
 # ---------------------------------------------------------------------------
 # Detecção de instabilidade do Auvo
@@ -1353,6 +2158,8 @@ AUVO_PALAVRAS_INSTABILIDADE = [
     "timeout", "timed out", "service unavailable", "502", "503", "504",
     "bad gateway", "gateway timeout", "internal server error", "500",
     "connection error", "connection refused", "temporarily unavailable",
+    "connection aborted", "remotedisconnected", "remote end closed connection",
+    "protocolerror",
 ]
 
 def detectar_instabilidade_auvo(exception: Exception) -> bool:
@@ -1369,6 +2176,190 @@ def montar_data_hora_auvo(data: str, hora: str) -> str:
     diferente do check-in lancado manualmente na UI.
     """
     return f"{data}T{hora}:00-03:00"
+
+def _normalizar_texto_segmento(texto):
+    texto = re.sub(r"\s+", " ", str(texto or "")).strip().upper()
+    texto = unicodedata.normalize("NFKD", texto).encode("ASCII", "ignore").decode("ASCII")
+    return texto
+
+
+def _extrair_resultado_auvo(data):
+    resultado = (data or {}).get("result", data)
+    if isinstance(resultado, dict) and "entityList" in resultado:
+        lista = resultado.get("entityList") or []
+        return lista[0] if lista else {}
+    if isinstance(resultado, list):
+        return resultado[0] if resultado else {}
+    return resultado if isinstance(resultado, dict) else {}
+
+
+def buscar_cliente_auvo(token, customer_id):
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Connection": "close"}
+    urls = [
+        f"https://api.auvo.com.br/v2/customers/{customer_id}",
+        "https://api.auvo.com.br/v2/customers/",
+    ]
+    for url in urls:
+        params = None
+        if url.endswith("/customers/"):
+            params = {"paramFilter": json.dumps({"id": int(customer_id)})}
+        response = HTTP_SESSION.get(url, headers=headers, params=params, timeout=AUVO_LIST_TIMEOUT)
+        if response.status_code in (500, 502, 503, 504):
+            raise Exception(f"HTTP {response.status_code}: Auvo instável ao consultar cliente")
+        if response.status_code == 404:
+            continue
+        if response.status_code != 200:
+            print(f"⚠️ Erro ao consultar cliente Auvo ({response.status_code}): {response.text[:200]}")
+            continue
+        cliente = _extrair_resultado_auvo(response.json())
+        if cliente:
+            return cliente
+    return {}
+
+
+def buscar_segmento_auvo(token, segment_id):
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Connection": "close"}
+    url = f"https://api.auvo.com.br/v2/segments/{segment_id}"
+    response = HTTP_SESSION.get(url, headers=headers, timeout=AUVO_LIST_TIMEOUT)
+    if response.status_code != 200:
+        print(f"⚠️ Erro ao consultar segmento Auvo ({response.status_code}): {response.text[:200]}")
+        return {}
+    return _extrair_resultado_auvo(response.json())
+
+
+def buscar_equipamentos_cliente(token, customer_id) -> list[dict]:
+    """Busca os equipamentos cadastrados para um cliente na Auvo.
+    Retorna [{"nome": "...", "serial": "..."}]."""
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Connection": "close"}
+    url = "https://api.auvo.com.br/v2/equipments/"
+    customer_id_int = int(customer_id)
+    params = {
+        # O campo de filtro no paramFilter tem que ser o nome real da
+        # propriedade retornada pela API de equipamentos: "associatedCustomerId"
+        # (confirmado pelo diagnóstico — o item não tem "customerId" nem
+        # "idCustomer", só "associatedCustomerId"). Usar "customerId" aqui
+        # fazia a Auvo ignorar o filtro e devolver a lista inteira.
+        "paramFilter": json.dumps({"associatedCustomerId": customer_id_int}),
+        "pageSize": 100,
+        "page": 1,
+    }
+
+    try:
+        response = HTTP_SESSION.get(url, headers=headers, params=params, timeout=AUVO_LIST_TIMEOUT)
+        if response.status_code != 200:
+            print(f"⚠️ Erro ao consultar equipamentos do cliente ({response.status_code}): {response.text[:200]}")
+            return []
+
+        data = response.json()
+        resultado = data.get("result", {}) or {}
+        lista = resultado.get("entityList") or resultado.get("equipmentList") or []
+        if not lista and isinstance(resultado, list):
+            lista = resultado
+
+        equipamentos = []
+        ignorados_de_outro_cliente = 0
+        
+        # Diagnóstico: imprime as chaves do primeiro item pra confirmar como a API retorna o cliente
+        if lista:
+            primeiro = lista[0] if isinstance(lista[0], dict) else {}
+            print(f"🔍 [DIAGNÓSTICO equipamentos] Total retornado pela API: {len(lista)}. Chaves do 1º item: {list(primeiro.keys())}. customer solicitado: {customer_id_int}. Valores de identificação do cliente no item: associatedCustomerId={primeiro.get('associatedCustomerId')}, customerId={primeiro.get('customerId')}, idCustomer={primeiro.get('idCustomer')}")
+        
+        for item in lista:
+            if not isinstance(item, dict):
+                continue
+
+            # Defesa extra: mesmo com o paramFilter corrigido, nunca confia
+            # cegamente no filtro remoto. Se o item trouxer o id do cliente
+            # dono do equipamento e ele não bater com o cliente pedido,
+            # descarta — isso garante que a lista jamais mistura
+            # equipamentos de clientes diferentes, mesmo que a Auvo devolva
+            # algo fora do esperado. O campo real é "associatedCustomerId"
+            # (customerId/idCustomer são mantidos como fallback só por
+            # segurança, caso a API mude de novo).
+            id_cliente_item = item.get(
+                "associatedCustomerId",
+                item.get("customerId", item.get("idCustomer")),
+            )
+            if id_cliente_item is not None:
+                try:
+                    if int(id_cliente_item) != customer_id_int:
+                        ignorados_de_outro_cliente += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
+            nome = (
+                item.get("description")
+                or item.get("name")
+                or item.get("equipmentDescription")
+                or item.get("productDescription")
+                or ""
+            ).strip()
+            serial = (item.get("serialNumber") or item.get("serial") or "").strip()
+            if nome:
+                equipamentos.append({"nome": nome, "serial": serial})
+
+        if ignorados_de_outro_cliente:
+            print(
+                f"⚠️ API Auvo retornou {ignorados_de_outro_cliente} equipamento(s) de outro "
+                f"cliente para customer_id={customer_id_int}; descartados antes de exibir."
+            )
+
+        # Deduplica por nome (preserva a ordem de aparição)
+        vistos = set()
+        unicos = []
+        for eq in equipamentos:
+            chave = eq["nome"].upper()
+            if chave not in vistos:
+                vistos.add(chave)
+                unicos.append(eq)
+        return unicos
+    except Exception as e:
+        print(f"⚠️ Erro ao buscar equipamentos do cliente {customer_id}: {e}")
+        return []
+
+
+def verificar_segmento_cliente(token, customer_id, continuar_sem_segmento=False, continuar_sem_contrato=False):
+    """
+    Verifica, na hora do check-in, o segmento cadastrado no cliente:
+      - Sem segmento (segmentId vazio): pede confirmação ("sem segmento cadastrado").
+      - Segmento com descrição "SEM CONTRATO": pede confirmação ("sem contrato").
+      - Qualquer outro segmento: ok, segue o check-in normalmente.
+    """
+    cliente = buscar_cliente_auvo(token, customer_id)
+    segment_id = cliente.get("segmentId")
+
+    if not segment_id:
+        if continuar_sem_segmento:
+            print(f"⚠️ Continuando sem segmento cadastrado para cliente {customer_id}.")
+            return {"ok": True, "status": "continuar_sem_segmento"}
+        return {"ok": False, "status": "cliente_sem_segmento"}
+
+    segmento = buscar_segmento_auvo(token, segment_id)
+    descricao_segmento = _normalizar_texto_segmento(segmento.get("description"))
+
+    if descricao_segmento == "SEM CONTRATO":
+        if continuar_sem_contrato:
+            print(f"⚠️ Continuando sem contrato para cliente {customer_id} (segmento: SEM CONTRATO).")
+            return {"ok": True, "status": "continuar_sem_contrato"}
+        return {"ok": False, "status": "cliente_sem_contrato"}
+
+    print(f"✅ Cliente {customer_id} possui segmento: {segmento.get('description')}")
+    return {"ok": True, "status": "com_segmento", "segmento": segmento.get("description")}
+
+
+def resposta_cliente_sem_segmento(empresa, codigo_cliente, status):
+    mensagens = {
+        "cliente_sem_segmento": "Cliente sem segmento cadastrado, deseja continuar o checkin",
+        "cliente_sem_contrato": "Cliente sem contrato, deseja continuar o checkin",
+    }
+    return {
+        "status": status,
+        "empresa": empresa,
+        "codigo_cliente": codigo_cliente,
+        "mensagem": mensagens.get(status, "Verifique o cadastro do cliente. Deseja continuar o checkin?"),
+    }
+
 
 
 
@@ -1417,11 +2408,11 @@ def _buscar_entity_list_tasks(token, customer_id, dias=3, cache_ttl=4):
         if item_cache and item_cache["expires_at"] > agora:
             return item_cache["entity_list"]
 
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Connection": "close"}
     params = {"paramFilter": json.dumps(filtros)}
     url = "https://api.auvo.com.br/v2/tasks/"
 
-    response = HTTP_SESSION.get(url, headers=headers, params=params, timeout=(5, 10))
+    response = HTTP_SESSION.get(url, headers=headers, params=params, timeout=AUVO_LIST_TIMEOUT)
     if response.status_code in (500, 502, 503, 504):
         raise Exception(f"HTTP {response.status_code}: Auvo instável")
     if response.status_code != 200:
@@ -1446,10 +2437,27 @@ def _buscar_entity_list_tasks(token, customer_id, dias=3, cache_ttl=4):
     return entity_list
 
 
+def _formatar_data_task_auvo(task_date):
+    task_date = (task_date or "").strip()
+    data_iso = task_date[:10] if len(task_date) >= 10 else ""
+    hora = task_date[11:16] if len(task_date) >= 16 else ""
+    data_br = data_iso
+    try:
+        data_br = datetime.strptime(data_iso, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        pass
+    return data_iso, data_br, hora
+
+
 def _formatar_task_resumo(t):
+    task_date = t.get("taskDate", "") or ""
+    data_iso, data_br, hora = _formatar_data_task_auvo(task_date)
     return {
         "taskID": t["taskID"],
-        "hora": (t.get("taskDate", "") or "")[11:16],
+        "data": data_iso,
+        "data_formatada": data_br,
+        "hora": hora,
+        "taskDate": task_date,
         "descricao": (t.get("orientation") or t.get("description") or "Sem descrição")[:80],
     }
 
@@ -1458,7 +2466,7 @@ def buscar_task_criada_recentemente(token, customer_id, id_user_to, task_type, d
     Quando o POST de criacao da task estoura timeout, o Auvo pode ter criado
     a task mesmo assim. Esta checagem evita esperar/recriar sem confirmar antes.
     """
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Connection": "close"}
     data_base = data_hora[:10]
     filtros = {
         "customerId": int(customer_id),
@@ -1467,7 +2475,7 @@ def buscar_task_criada_recentemente(token, customer_id, id_user_to, task_type, d
         "idUserTo": id_user_to,
     }
     params = {"paramFilter": json.dumps(filtros)}
-    response = HTTP_SESSION.get("https://api.auvo.com.br/v2/tasks/", headers=headers, params=params, timeout=(5, 8))
+    response = HTTP_SESSION.get("https://api.auvo.com.br/v2/tasks/", headers=headers, params=params, timeout=AUVO_CONFIRM_TIMEOUT)
     if response.status_code in (500, 502, 503, 504):
         raise Exception(f"HTTP {response.status_code}: Auvo instável ao confirmar task criada")
     if response.status_code != 200:
@@ -1507,7 +2515,8 @@ def criar_atendimento_com_checkin(token, customer_id, id_user_from, id_user_to,
                                    task_type, data_hora, descricao):
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type":  "application/json"
+        "Content-Type":  "application/json",
+        "Connection":    "close"
     }
     payload_task = {
         "customerId":  customer_id,
@@ -1525,7 +2534,7 @@ def criar_atendimento_com_checkin(token, customer_id, id_user_from, id_user_to,
                 "https://api.auvo.com.br/v2/tasks/",
                 json=payload_task,
                 headers=headers,
-                timeout=(5, 12)
+                timeout=AUVO_CREATE_TIMEOUT
             )
 
             if response_task.status_code in (500, 502, 503, 504):
@@ -1544,9 +2553,9 @@ def criar_atendimento_com_checkin(token, customer_id, id_user_from, id_user_to,
             else:
                 raise Exception(f"Estrutura inesperada: {data}")
 
-        except requests.exceptions.ReadTimeout as e:
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
             task_id_timeout = None
-            for tentativa_confirmacao in range(1, 4):
+            for tentativa_confirmacao in range(1, AUVO_CONFIRM_RETRIES + 1):
                 try:
                     task_id_timeout = buscar_task_criada_recentemente(
                         token, customer_id, id_user_to, task_type, data_hora, descricao
@@ -1555,11 +2564,11 @@ def criar_atendimento_com_checkin(token, customer_id, id_user_from, id_user_to,
                         _limpar_cache_tasks()
                         return task_id_timeout
                 except Exception as erro_confirmacao:
-                    print(f"⚠️ Confirmação pós-timeout falhou ({tentativa_confirmacao}/3): {erro_confirmacao}")
-                time.sleep(0.4)
+                    print(f"⚠️ Confirmação pós-timeout falhou ({tentativa_confirmacao}/{AUVO_CONFIRM_RETRIES}): {erro_confirmacao}")
+                time.sleep(AUVO_CONFIRM_BASE_WAIT * tentativa_confirmacao)
 
             if tentativa < 3:
-                espera = tentativa * 2
+                espera = tentativa * 4
                 print(f"⚠️ Timeout ao criar task e nenhuma task confirmada. Tentativa {tentativa}/3. Aguardando {espera}s...")
                 time.sleep(espera)
             else:
@@ -1601,8 +2610,8 @@ def buscar_tasks_pausadas(token, customer_id):
 
 def buscar_tasks_abertas(token, customer_id):
     """
-    Retorna lista de tasks abertas (com check-in mas sem check-out) do dia para o cliente.
-    Cada item: {"taskID": int, "hora": str, "descricao": str}
+    Retorna lista de tasks abertas (com check-in mas sem check-out) dos últimos 10 dias para o cliente.
+    Cada item: {"taskID": int, "data": str, "data_formatada": str, "hora": str, "descricao": str}
     Retorna [] se não houver nenhuma. Levanta Exception em caso de instabilidade.
     """
     if not customer_id:
@@ -1610,7 +2619,7 @@ def buscar_tasks_abertas(token, customer_id):
 
     for tentativa in range(1, 4):
         try:
-            entity_list = _buscar_entity_list_tasks(token, customer_id)
+            entity_list = _buscar_entity_list_tasks(token, customer_id, dias=10)
 
             abertas = [t for t in entity_list if t.get("checkIn") and not t.get("checkOut")]
             pausadas = [t for t in abertas if _status_task_auvo(t) == 6]
@@ -1635,7 +2644,7 @@ def buscar_tasks_abertas(token, customer_id):
                 print(f"✅ Task aberta: #{t['taskID']} | {hora_fmt} | {descricao}")
 
             if not abertas:
-                print("⚠️ entityList vazia — sem atendimento aberto hoje para este cliente.")
+                print("⚠️ entityList vazia — sem atendimento aberto nos últimos 10 dias para este cliente.")
 
             return [_formatar_task_resumo(t) for t in abertas]
         except Exception as e:
@@ -2013,10 +3022,13 @@ def _selecionar_motivo_pausa(page, motivo: str):
 
     print(f"    Motivo da pausa selecionado: {motivo}")
 
-def realizar_inicio_pausa_ui_invisivel(task_id, data_pausa, hora_pausa, motivo):
+def realizar_inicio_pausa_ui_invisivel(task_id, data_pausa, hora_pausa, motivo, cancel_key=None):
     print(f"\n[UI] Iniciando pausa para Task #{task_id}...")
+    status_key = f"pausa_{task_id}"
+    cancel_keys = (status_key, cancel_key)
 
     for tentativa in range(1, 4):
+        verificar_cancelamento(*cancel_keys)
         with sync_playwright() as playwright:
             browser, context, page = _abrir_browser_e_pagina(playwright)
             try:
@@ -2025,23 +3037,33 @@ def realizar_inicio_pausa_ui_invisivel(task_id, data_pausa, hora_pausa, motivo):
                 page.goto(url_tarefa, wait_until="domcontentloaded", timeout=AUVO_UI_TIMEOUT)
                 _garantir_login(page, context, url_destino=url_tarefa)
 
+                # Aguarda o SPA renderizar antes de checar erros HTTP.
+                try:
+                    page.locator('text="Controle de horas"').first.wait_for(state="visible", timeout=8000)
+                except Exception:
+                    pass  # se não aparecer, _pagina_com_erro_auvo decide a seguir
+
                 if _pagina_com_erro_auvo(page):
                     raise Exception("auvo_instavel: página de erro HTTP detectada na UI")
 
-                task_status[f"pausa_{task_id}"] = "abrindo_task"
+                verificar_cancelamento(*cancel_keys)
+                task_status[status_key] = "abrindo_task"
                 _clicar_editar(page, secao="Controle de horas", timeout=15000)
 
                 btn_add = page.locator("#adicionarAtividadeButton")
                 btn_add.wait_for(state="visible", timeout=8000)
 
-                task_status[f"pausa_{task_id}"] = "preenchendo_pausa"
+                verificar_cancelamento(*cancel_keys)
+                task_status[status_key] = "preenchendo_pausa"
                 _clicar_item_dropdown(page, "Início da Pausa")
 
                 page.locator('input[name="datePicker"]:visible').last.wait_for(state="visible", timeout=12000)
                 _preencher_data_hora(page, data_pausa, hora_pausa)
                 _selecionar_motivo_pausa(page, motivo)
 
-                task_status[f"pausa_{task_id}"] = "lancando_pausa"
+                verificar_cancelamento(*cancel_keys)
+                task_status[status_key] = "lancando_pausa"
+                verificar_cancelamento(*cancel_keys)
                 btn_salvar = page.locator("#edicao-salvar:visible").last
                 btn_salvar.wait_for(state="visible", timeout=10000)
                 btn_salvar.click(force=True)
@@ -2055,7 +3077,13 @@ def realizar_inicio_pausa_ui_invisivel(task_id, data_pausa, hora_pausa, motivo):
                 context.storage_state(path=AUVO_STATE_PATH)
                 print(f"✓ Task #{task_id} — início da pausa salvo!")
                 _limpar_cache_tasks()
-                task_status[f"pausa_{task_id}"] = "done"
+                task_status[status_key] = "done"
+                limpar_cancelamento(status_key)
+                return
+
+            except ProcessoCancelado:
+                task_status[status_key] = "cancelado"
+                print(f"⛔ Início da pausa cancelado para Task #{task_id}.")
                 return
 
             except Exception as e:
@@ -2078,20 +3106,23 @@ def realizar_inicio_pausa_ui_invisivel(task_id, data_pausa, hora_pausa, motivo):
                 if tentativa < 3:
                     espera = tentativa * 8 if eh_timeout_ui else tentativa * 10
                     print(f"⚠️ Tentando novamente em {espera}s...")
-                    time.sleep(espera)
+                    dormir_com_cancelamento(espera, *cancel_keys)
                 else:
-                    task_status[f"pausa_{task_id}"] = "auvo_instavel" if instavel else "erro"
-                    task_status[f"pausa_{task_id}_mensagem"] = str(e)
+                    task_status[status_key] = "auvo_instavel" if instavel else "erro"
+                    task_status[f"{status_key}_mensagem"] = str(e)
                     print(f"❌ Início da pausa falhou após {tentativa} tentativas.")
 
             finally:
                 browser.close()
 
 
-def realizar_fim_pausa_ui_invisivel(task_id, data_pausa, hora_pausa):
+def realizar_fim_pausa_ui_invisivel(task_id, data_pausa, hora_pausa, cancel_key=None):
     print(f"\n[UI] Finalizando pausa para Task #{task_id}...")
+    status_key = f"despausa_{task_id}"
+    cancel_keys = (status_key, cancel_key)
 
     for tentativa in range(1, 4):
+        verificar_cancelamento(*cancel_keys)
         with sync_playwright() as playwright:
             browser, context, page = _abrir_browser_e_pagina(playwright)
             try:
@@ -2100,22 +3131,32 @@ def realizar_fim_pausa_ui_invisivel(task_id, data_pausa, hora_pausa):
                 page.goto(url_tarefa, wait_until="domcontentloaded", timeout=AUVO_UI_TIMEOUT)
                 _garantir_login(page, context, url_destino=url_tarefa)
 
+                # Aguarda o SPA renderizar antes de checar erros HTTP.
+                try:
+                    page.locator('text="Controle de horas"').first.wait_for(state="visible", timeout=8000)
+                except Exception:
+                    pass  # se não aparecer, _pagina_com_erro_auvo decide a seguir
+
                 if _pagina_com_erro_auvo(page):
                     raise Exception("auvo_instavel: página de erro HTTP detectada na UI")
 
-                task_status[f"despausa_{task_id}"] = "abrindo_task"
+                verificar_cancelamento(*cancel_keys)
+                task_status[status_key] = "abrindo_task"
                 _clicar_editar(page, secao="Controle de horas", timeout=15000)
 
                 btn_add = page.locator("#adicionarAtividadeButton")
                 btn_add.wait_for(state="visible", timeout=8000)
 
-                task_status[f"despausa_{task_id}"] = "preenchendo_despausa"
+                verificar_cancelamento(*cancel_keys)
+                task_status[status_key] = "preenchendo_despausa"
                 _clicar_item_dropdown(page, "Fim da Pausa")
 
                 page.locator('input[name="datePicker"]:visible').last.wait_for(state="visible", timeout=12000)
                 _preencher_data_hora(page, data_pausa, hora_pausa)
 
-                task_status[f"despausa_{task_id}"] = "lancando_despausa"
+                verificar_cancelamento(*cancel_keys)
+                task_status[status_key] = "lancando_despausa"
+                verificar_cancelamento(*cancel_keys)
                 btn_salvar = page.locator("#edicao-salvar:visible").last
                 btn_salvar.wait_for(state="visible", timeout=10000)
                 btn_salvar.click(force=True)
@@ -2129,7 +3170,13 @@ def realizar_fim_pausa_ui_invisivel(task_id, data_pausa, hora_pausa):
                 context.storage_state(path=AUVO_STATE_PATH)
                 print(f"✓ Task #{task_id} — fim da pausa salvo!")
                 _limpar_cache_tasks()
-                task_status[f"despausa_{task_id}"] = "done"
+                task_status[status_key] = "done"
+                limpar_cancelamento(status_key)
+                return
+
+            except ProcessoCancelado:
+                task_status[status_key] = "cancelado"
+                print(f"⛔ Fim da pausa cancelado para Task #{task_id}.")
                 return
 
             except Exception as e:
@@ -2151,10 +3198,10 @@ def realizar_fim_pausa_ui_invisivel(task_id, data_pausa, hora_pausa):
                 if tentativa < 3:
                     espera = tentativa * 8 if eh_timeout_ui else tentativa * 10
                     print(f"⚠️ Tentando novamente em {espera}s...")
-                    time.sleep(espera)
+                    dormir_com_cancelamento(espera, *cancel_keys)
                 else:
-                    task_status[f"despausa_{task_id}"] = "auvo_instavel" if instavel else "erro"
-                    task_status[f"despausa_{task_id}_mensagem"] = str(e)
+                    task_status[status_key] = "auvo_instavel" if instavel else "erro"
+                    task_status[f"{status_key}_mensagem"] = str(e)
                     print(f"❌ Fim da pausa falhou após {tentativa} tentativas.")
 
             finally:
@@ -2162,6 +3209,48 @@ def realizar_fim_pausa_ui_invisivel(task_id, data_pausa, hora_pausa):
 # Check-in (com retry em instabilidade do Auvo)
 # ---------------------------------------------------------------------------
 task_status = {}
+task_cancelados = set()
+task_cancelados_lock = threading.Lock()
+
+class ProcessoCancelado(Exception):
+    pass
+
+
+def solicitar_cancelamento(chave):
+    chave = str(chave or '').strip()
+    if not chave:
+        return False
+    with task_cancelados_lock:
+        task_cancelados.add(chave)
+    task_status[chave] = "cancelado"
+    return True
+
+
+def limpar_cancelamento(chave):
+    chave = str(chave or '').strip()
+    if not chave:
+        return
+    with task_cancelados_lock:
+        task_cancelados.discard(chave)
+
+
+def cancelamento_solicitado(*chaves):
+    chaves_normalizadas = [str(chave) for chave in chaves if chave is not None]
+    with task_cancelados_lock:
+        return any(chave in task_cancelados for chave in chaves_normalizadas)
+
+
+def verificar_cancelamento(*chaves):
+    if cancelamento_solicitado(*chaves):
+        raise ProcessoCancelado("Processo cancelado pelo usuário.")
+
+
+def dormir_com_cancelamento(segundos, *chaves):
+    fim = time.time() + segundos
+    while time.time() < fim:
+        verificar_cancelamento(*chaves)
+        time.sleep(min(0.5, fim - time.time()))
+
 
 PAUSA_MOTIVOS = [
     "Fim de Expediente",
@@ -2183,10 +3272,22 @@ def _pagina_com_erro_auvo(page) -> bool:
     """
     try:
         titulo = page.title().lower()
-        # Títulos típicos de páginas de erro de servidor/proxy
-        erros_titulo = ["502", "503", "504", "bad gateway", "service unavailable",
-                        "error", "gateway timeout", "server error"]
-        if any(e in titulo for e in erros_titulo):
+        url_atual = page.url
+
+        # Títulos genuínos de páginas de erro HTTP de servidor/proxy.
+        # ATENÇÃO: NÃO usar substring simples ("502" in titulo) pois o título
+        # normal do Auvo inclui o ID da task, ex: "auvo # detalhes da tarefa 75023805"
+        # — o ID 75023805 contém "502" e causaria falso positivo.
+        # A checagem usa regex de palavra-isolada para os códigos numéricos,
+        # e substring apenas para as frases textuais que nunca aparecem em títulos normais.
+        import re as _re
+        # Códigos HTTP só disparam se aparecerem como "palavra" isolada no título
+        # (ex: título "502 Bad Gateway" bate; "tarefa 75023805" não bate)
+        if _re.search(r'\b(502|503|504)\b', titulo):
+            return True
+        # Frases textuais de erro — substring é segura aqui pois são únicas
+        erros_titulo_texto = ["bad gateway", "service unavailable", "gateway timeout", "server error"]
+        if any(e in titulo for e in erros_titulo_texto):
             return True
 
         # Verifica se o body inteiro é curtíssimo (página de erro puro, sem app carregado)
@@ -2200,10 +3301,13 @@ def _pagina_com_erro_auvo(page) -> bool:
     return False
 
 
-def realizar_checkin_ui_invisivel(task_id, data_checkin, hora_checkin, inicio=None):
+def realizar_checkin_ui_invisivel(task_id, data_checkin, hora_checkin, inicio=None, cancel_key=None):
     print(f"\n[UI] Iniciando check-in para Task #{task_id}...")
+    status_key = str(task_id)
+    cancel_keys = (status_key, cancel_key)
 
     for tentativa in range(1, 4):
+        verificar_cancelamento(*cancel_keys)
         with sync_playwright() as playwright:
             browser, context, page = _abrir_browser_e_pagina(playwright)
             try:
@@ -2215,20 +3319,29 @@ def realizar_checkin_ui_invisivel(task_id, data_checkin, hora_checkin, inicio=No
                 if url_tarefa not in page.url:
                     page.goto(url_tarefa, wait_until="domcontentloaded", timeout=AUVO_UI_TIMEOUT)
 
+                # Aguarda o SPA renderizar antes de checar erros HTTP.
+                try:
+                    page.locator('text="Controle de horas"').first.wait_for(state="visible", timeout=8000)
+                except Exception:
+                    pass  # se não aparecer, _pagina_com_erro_auvo decide a seguir
+
                 if _pagina_com_erro_auvo(page):
                     raise Exception("auvo_instavel: página de erro HTTP detectada na UI")
 
+                verificar_cancelamento(*cancel_keys)
                 _clicar_editar(page, secao="Controle de horas")
 
                 btn_add = page.locator("#adicionarAtividadeButton")
                 btn_add.wait_for(state="visible", timeout=10000)
 
+                verificar_cancelamento(*cancel_keys)
                 _clicar_item_dropdown(page, "Check-In")
 
                 # Aguarda o modal de data/hora abrir
                 page.locator('input[name="datePicker"]:visible').last.wait_for(state="visible", timeout=12000)
                 _preencher_data_hora(page, data_checkin, hora_checkin)
 
+                verificar_cancelamento(*cancel_keys)
                 btn_salvar = page.locator("#edicao-salvar:visible").last
                 btn_salvar.wait_for(state="visible", timeout=8000)
                 btn_salvar.click(force=True)
@@ -2237,12 +3350,18 @@ def realizar_checkin_ui_invisivel(task_id, data_checkin, hora_checkin, inicio=No
                 context.storage_state(path=AUVO_STATE_PATH)
                 print(f"✓ Task #{task_id} — check-in salvo!")
                 _limpar_cache_tasks()
-                task_status[str(task_id)] = "done"
+                task_status[status_key] = "done"
+                limpar_cancelamento(status_key)
 
                 if inicio:
                     total = time.time() - inicio
                     print(f"⏱️ Tempo total (clique → check-in salvo): {total:.1f}s")
                 return  # sucesso — sai do loop
+
+            except ProcessoCancelado:
+                task_status[status_key] = "cancelado"
+                print(f"⛔ Check-in cancelado para Task #{task_id}.")
+                return
 
             except Exception as e:
                 print(f"[UI ERROR] Tentativa {tentativa}/3 — Falha no check-in Task #{task_id}: {e}")
@@ -2263,13 +3382,13 @@ def realizar_checkin_ui_invisivel(task_id, data_checkin, hora_checkin, inicio=No
                 if tentativa < 3:
                     espera = tentativa * 8 if eh_timeout_ui else tentativa * 10
                     if instavel:
-                        task_status[str(task_id)] = "auvo_instavel"
+                        task_status[status_key] = "auvo_instavel"
                         print(f"⚠️ Auvo com instabilidade. Aguardando {espera}s antes de tentar novamente...")
                     else:
                         print(f"⚠️ Timeout de UI (app lento). Aguardando {espera}s antes de tentar novamente...")
-                    time.sleep(espera)
+                    dormir_com_cancelamento(espera, *cancel_keys)
                 else:
-                    task_status[str(task_id)] = "auvo_instavel" if instavel else "erro"
+                    task_status[status_key] = "auvo_instavel" if instavel else "erro"
                     print(f"❌ Check-in falhou após {tentativa} tentativas.")
 
             finally:
@@ -2279,10 +3398,13 @@ def realizar_checkin_ui_invisivel(task_id, data_checkin, hora_checkin, inicio=No
 # ---------------------------------------------------------------------------
 # Check-out (com retry em instabilidade do Auvo)
 # ---------------------------------------------------------------------------
-def realizar_checkout_ui_invisivel(task_id, data_checkout, hora_checkout, relato):
+def realizar_checkout_ui_invisivel(task_id, data_checkout, hora_checkout, relato, cancel_key=None):
     print(f"\n[UI] Iniciando check-out para Task #{task_id}...")
+    status_key = f"checkout_{task_id}"
+    cancel_keys = (status_key, cancel_key)
 
     for tentativa in range(1, 4):
+        verificar_cancelamento(*cancel_keys)
         with sync_playwright() as playwright:
             browser, context, page = _abrir_browser_e_pagina(playwright)
             try:
@@ -2294,14 +3416,22 @@ def realizar_checkout_ui_invisivel(task_id, data_checkout, hora_checkout, relato
                 if url_tarefa not in page.url:
                     page.goto(url_tarefa, wait_until="domcontentloaded", timeout=AUVO_UI_TIMEOUT)
 
+                # Aguarda o SPA renderizar antes de checar erros HTTP.
+                try:
+                    page.locator('text="Relato do usuário"').first.wait_for(state="visible", timeout=8000)
+                except Exception:
+                    pass  # se não aparecer, _pagina_com_erro_auvo decide a seguir
+
                 if _pagina_com_erro_auvo(page):
                     raise Exception("auvo_instavel: página de erro HTTP detectada na UI")
 
+                verificar_cancelamento(*cancel_keys)
                 page.locator('text="Relato do usuário"').first.wait_for(state="visible", timeout=AUVO_UI_TIMEOUT)
                 print(f"✅ Página pronta: {page.url}")
 
                 # ── PASSO 1: Preenche e salva o relato ───────────────────────────
                 print("Preenchendo relato...")
+                verificar_cancelamento(*cancel_keys)
                 _clicar_editar(page, secao="Relato do usuário")
 
                 campo_relato = page.locator('textarea, div[contenteditable="true"]').first
@@ -2309,6 +3439,8 @@ def realizar_checkout_ui_invisivel(task_id, data_checkout, hora_checkout, relato
                 campo_relato.click()
                 page.keyboard.press("Control+A")
                 campo_relato.fill(relato)
+
+                verificar_cancelamento(*cancel_keys)
 
                 # Salva o relato antes de ir para a seção de horas
                 print("Salvando relato...")
@@ -2353,6 +3485,8 @@ def realizar_checkout_ui_invisivel(task_id, data_checkout, hora_checkout, relato
                 # Aguarda DOM estabilizar antes de abrir próxima seção
                 time.sleep(0.5)
 
+                verificar_cancelamento(*cancel_keys)
+
                 # ── PASSO 2: Abre "Controle de horas" e lança check-out ──────
                 print("Lançando check-out...")
                 # _clicar_editar já aguarda #adicionarAtividadeButton ficar visível
@@ -2362,13 +3496,17 @@ def realizar_checkout_ui_invisivel(task_id, data_checkout, hora_checkout, relato
                 btn_add = page.locator("#adicionarAtividadeButton")
                 btn_add.wait_for(state="visible", timeout=8000)
 
+                verificar_cancelamento(*cancel_keys)
                 _clicar_item_dropdown(page, "Check-Out")
 
                 # Aguarda o modal de data/hora abrir
                 page.locator('input[name="datePicker"]:visible').last.wait_for(state="visible", timeout=12000)
                 _preencher_data_hora(page, data_checkout, hora_checkout)
 
+                verificar_cancelamento(*cancel_keys)
+
                 # ── PASSO 3: Salva check-out com confirmação em camadas ──────
+                verificar_cancelamento(*cancel_keys)
                 btn_salvar = page.locator("#edicao-salvar:visible").last
                 btn_salvar.wait_for(state="visible", timeout=10000)
                 btn_salvar.click(force=True)
@@ -2411,8 +3549,14 @@ def realizar_checkout_ui_invisivel(task_id, data_checkout, hora_checkout, relato
                 context.storage_state(path=AUVO_STATE_PATH)
                 print(f"✓ Check-out Task #{task_id} salvo!")
                 _limpar_cache_tasks()
-                task_status[f"checkout_{task_id}"] = "done"
+                task_status[status_key] = "done"
+                limpar_cancelamento(status_key)
                 return  # sucesso
+
+            except ProcessoCancelado:
+                task_status[status_key] = "cancelado"
+                print(f"⛔ Check-out cancelado para Task #{task_id}.")
+                return
 
             except Exception as e:
                 print(f"[ERRO] Tentativa {tentativa}/3 — Falha no check-out Task #{task_id}: {e}")
@@ -2433,19 +3577,141 @@ def realizar_checkout_ui_invisivel(task_id, data_checkout, hora_checkout, relato
                 if tentativa < 3:
                     espera = tentativa * 8 if eh_timeout_ui else tentativa * 10
                     if instavel:
-                        task_status[f"checkout_{task_id}"] = "auvo_instavel"
+                        task_status[status_key] = "auvo_instavel"
                         print(f"⚠️ Auvo com instabilidade. Aguardando {espera}s antes de tentar novamente...")
                     elif eh_timeout_ui:
                         print(f"⚠️ Timeout no salvamento (UI lenta). Aguardando {espera}s e tentando novamente...")
                     else:
                         print(f"⚠️ Erro genérico. Aguardando {espera}s antes de tentar novamente...")
-                    time.sleep(espera)
+                    dormir_com_cancelamento(espera, *cancel_keys)
                 else:
-                    task_status[f"checkout_{task_id}"] = "auvo_instavel" if instavel else "erro"
+                    task_status[status_key] = "auvo_instavel" if instavel else "erro"
                     print(f"❌ Check-out falhou após {tentativa} tentativas.")
 
             finally:
                 browser.close()
+
+
+# ---------------------------------------------------------------------------
+# Apelidos de equipamento (tabela equipamentos_keywords no Supabase) e
+# comparação fuzzy contra o que está cadastrado pro cliente na Auvo.
+# ---------------------------------------------------------------------------
+_EQUIPAMENTOS_KEYWORDS_CACHE = {}
+
+
+def _obter_equipamentos_keywords(cliente) -> dict:
+    """Busca a tabela de apelidos (equipamentos_keywords) no Supabase.
+    Chave = apelido normalizado, valor = nome oficial do equipamento.
+    Se a tabela não existir/falhar, segue sem apelidos (usa o nome cru)."""
+    if _EQUIPAMENTOS_KEYWORDS_CACHE:
+        return _EQUIPAMENTOS_KEYWORDS_CACHE
+
+    try:
+        resp = cliente.table("equipamentos_keywords").select("apelido, equipamento_oficial").execute()
+        for linha in resp.data or []:
+            apelido = _normalizar_equipamento(linha.get("apelido") or "")
+            oficial = (linha.get("equipamento_oficial") or "").strip()
+            if apelido and oficial:
+                _EQUIPAMENTOS_KEYWORDS_CACHE[apelido] = oficial
+        if _EQUIPAMENTOS_KEYWORDS_CACHE:
+            print(f"✅ Apelidos de equipamento carregados do Supabase: {len(_EQUIPAMENTOS_KEYWORDS_CACHE)} entradas")
+    except Exception as e:
+        print(f"⚠️ Não foi possível buscar equipamentos_keywords no Supabase: {e}")
+
+    return _EQUIPAMENTOS_KEYWORDS_CACHE
+
+
+def _normalizar_equipamento(texto: str) -> str:
+    texto = (texto or "").upper().strip()
+    texto = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
+    texto = re.sub(r'[^A-Z0-9 ]', '', texto)
+    texto = re.sub(r'\s+', ' ', texto).strip()
+    return texto
+
+
+_obter_equipamentos_keywords(_supabase_client)
+
+
+def aplicar_apelido_equipamento(nome_citado: str) -> str:
+    """Traduz um apelido/menção do chat (ex: 'kurumin') pro nome oficial
+    cadastrado no Auvo, usando a tabela de apelidos. Match exato primeiro,
+    depois parcial (apelido contido no texto ou vice-versa). Se não achar
+    nada, devolve o nome citado original sem alterar."""
+    if not nome_citado:
+        return nome_citado
+
+    apelidos = _obter_equipamentos_keywords(_supabase_client)
+    chave = _normalizar_equipamento(nome_citado)
+
+    if chave in apelidos:
+        return apelidos[chave]
+
+    for apelido, oficial in apelidos.items():
+        if apelido in chave or chave in apelido:
+            return oficial
+
+    return nome_citado
+
+
+def equipamento_esta_vinculado(nome_equipamento: str, equipamentos_cliente: list[dict], limiar: float = 0.5) -> bool:
+    """Verifica (por fuzzy match) se nome_equipamento corresponde a algum
+    equipamento já cadastrado pro cliente no Auvo. Usado tanto pra apelidos
+    conhecidos quanto pra atribuições livres (ex: 'Kurumin' batendo com
+    'RELOGIO DE PONTO KURUMIN' cadastrado no cliente)."""
+    if not nome_equipamento or not equipamentos_cliente:
+        return False
+
+    alvo = _normalizar_equipamento(nome_equipamento)
+    for eq in equipamentos_cliente:
+        nome_cadastrado = _normalizar_equipamento(eq.get("nome", ""))
+        if not nome_cadastrado:
+            continue
+        if alvo in nome_cadastrado or nome_cadastrado in alvo:
+            return True
+        similaridade = difflib.SequenceMatcher(None, alvo, nome_cadastrado).ratio()
+        if similaridade >= limiar:
+            return True
+    return False
+
+
+def verificar_equipamento_checkout(token, customer_id, nome_cliente: str,
+                                     equipamento_relacionado: bool,
+                                     equipamento_citado: str,
+                                     task_id: str = "") -> dict:
+    """
+    Chamar no fluxo de checkout, depois de gerar o relato e ANTES de mostrar
+    a confirmação final pro atendente. Retorna um dict com um destes status:
+      - {"status": "nao_aplica"}
+          → atendimento não é sobre equipamento, segue o checkout normal.
+      - {"status": "selecionar", "opcoes": [nomes...]}
+          → é sobre equipamento mas ninguém citou qual; o front-end deve
+            abrir o modal de seleção com essas opções (equipamentos
+            cadastrados do cliente no Auvo). Se a lista vier vazia, o
+            front-end deve liberar um campo de texto livre pro atendente
+            digitar o nome — esse texto entra direto como "não vinculado".
+      - {"status": "vinculado", "equipamento": nome}
+          → equipamento identificado E já cadastrado pro cliente. Segue normal.
+      - {"status": "nao_vinculado", "equipamento": nome}
+          → equipamento identificado mas NÃO cadastrado pro cliente.
+            Já foi gravado na planilha de equipamentos não vinculados.
+    """
+    if not equipamento_relacionado:
+        return {"status": "nao_aplica"}
+
+    equipamentos_cliente = buscar_equipamentos_cliente(token, customer_id)
+    opcoes = [eq["nome"] for eq in equipamentos_cliente]
+
+    if not equipamento_citado:
+        return {"status": "selecionar", "opcoes": opcoes}
+
+    nome_oficial = aplicar_apelido_equipamento(equipamento_citado)
+
+    if equipamento_esta_vinculado(nome_oficial, equipamentos_cliente):
+        return {"status": "vinculado", "equipamento": nome_oficial}
+
+    # Se a IA citou um equipamento mas ele não bate com nenhum dos vinculados, 
+    # abre a lista para o usuário confirmar qual é de fato (ou registrar novo manualmente).
+    return {"status": "selecionar", "opcoes": opcoes}
 
 
 # ---------------------------------------------------------------------------
@@ -2617,7 +3883,7 @@ def pegar_mensagens_chat():
 # Fluxo combinado: criar checkin + checkout em sequência
 # (usado quando checkout é clicado sem atendimento aberto)
 # ---------------------------------------------------------------------------
-def fluxo_checkin_e_checkout(empresa, mensagens, codigo_cliente, inicio_escolhido=None):
+def fluxo_checkin_e_checkout(empresa, mensagens, codigo_cliente, inicio_escolhido=None, sistema=None, cancel_key=None):
     """
     Executa o ciclo completo:
       1. Gera descrição com IA
@@ -2627,16 +3893,26 @@ def fluxo_checkin_e_checkout(empresa, mensagens, codigo_cliente, inicio_escolhid
     Atualiza task_status["full_flow_{empresa}"] ao longo do processo.
     """
     chave = f"full_flow_{codigo_cliente}"
+    task_id = None
     try:
-        task_status[chave] = "gerando_descricao"
+        limpar_cancelamento(chave)
+        verificar_cancelamento(chave, cancel_key)
+        task_status[chave] = "gerando_textos"
 
-        # --- Paralelo: descrição + hora de início ---
+        # --- Uma chamada ao Gemini: descrição + relato ---
         descricao_resultado = [None]
-        def _gerar_desc():
-            descricao_resultado[0] = gerar_descricao_com_ia(mensagens)
+        relato_resultado = [None]
+        equipamento_relacionado_resultado = [False]
+        equipamento_citado_resultado = [""]
+        problema_equipamento_resultado = [""]
+        def _gerar_textos():
+            (descricao_resultado[0], relato_resultado[0],
+             equipamento_relacionado_resultado[0], equipamento_citado_resultado[0],
+             problema_equipamento_resultado[0]) = gerar_descricao_e_relato_com_ia(mensagens, sistema)
             print(f"📝 Descrição: {descricao_resultado[0]}")
+            print(f"📝 Relato: {relato_resultado[0]}")
 
-        t_desc = threading.Thread(target=_gerar_desc)
+        t_desc = threading.Thread(target=_gerar_textos)
         t_desc.start()
 
         if inicio_escolhido:
@@ -2647,6 +3923,15 @@ def fluxo_checkin_e_checkout(empresa, mensagens, codigo_cliente, inicio_escolhid
         hora_checkout, data_checkout  = pegar_hora_e_data_ultima_mensagem(mensagens)
 
         t_desc.join()
+        verificar_cancelamento(chave, cancel_key)
+
+        descricao_confirmada, relato_confirmado = aguardar_confirmacao_textos_fluxo(
+            chave,
+            descricao_resultado[0],
+            relato_resultado[0],
+            cancel_key=cancel_key,
+        )
+        verificar_cancelamento(chave, cancel_key)
 
         if not hora_inicio:
             task_status[chave] = "erro"
@@ -2654,6 +3939,7 @@ def fluxo_checkin_e_checkout(empresa, mensagens, codigo_cliente, inicio_escolhid
             return
 
         token = autenticar()
+        verificar_cancelamento(chave, cancel_key)
 
         task_status[chave] = "criando_task"
         task_id = criar_atendimento_com_checkin(
@@ -2663,41 +3949,147 @@ def fluxo_checkin_e_checkout(empresa, mensagens, codigo_cliente, inicio_escolhid
             id_user_to   = ID_USER,
             task_type    = 200374,
             data_hora    = montar_data_hora_auvo(data_inicio, hora_inicio),
-            descricao    = descricao_resultado[0]
+            descricao    = descricao_confirmada
         )
         print(f"✅ Task #{task_id} criada no fluxo combinado.")
+        verificar_cancelamento(chave, cancel_key, str(task_id))
 
         task_status[chave] = "checkin"
-        realizar_checkin_ui_invisivel(task_id, data_inicio, hora_inicio)
+        realizar_checkin_ui_invisivel(task_id, data_inicio, hora_inicio, cancel_key=cancel_key or chave)
 
         # Aguarda check-in confirmar antes de ir ao checkout
         for _ in range(30):
+            verificar_cancelamento(chave, cancel_key, str(task_id))
+            if task_status.get(str(task_id)) == "cancelado":
+                raise ProcessoCancelado("Processo cancelado pelo usuário.")
             if task_status.get(str(task_id)) == "done":
                 break
-            time.sleep(2)
+            dormir_com_cancelamento(2, chave, cancel_key, str(task_id))
 
-        task_status[chave] = "gerando_relato"
-        relato = gerar_relato_com_ia(mensagens)
-        print(f"📝 Relato: {relato}")
+        verificar_cancelamento(chave, cancel_key, str(task_id))
+
+        # --- Verificacao de equipamento antes do checkout ---
+        # O token pode ter expirado durante check-in; autenticar() renova se necessario.
+        _token_equip = autenticar()
+        verificacao_equipamento = verificar_equipamento_checkout(
+            _token_equip,
+            codigo_cliente,
+            empresa,
+            equipamento_relacionado_resultado[0],
+            equipamento_citado_resultado[0],
+            task_id,
+        )
+
+        if verificacao_equipamento.get("status") == "selecionar":
+            # Equipamento nao identificado -> abre modal de selecao pro atendente
+            relato = aguardar_confirmacao_relato_checkout(
+                task_id,
+                data_checkout or data_inicio,
+                hora_checkout,
+                relato_confirmado,
+                cancel_key=cancel_key or chave,
+                flow_key=chave,
+                verificacao_equipamento=verificacao_equipamento,
+            )
+        else:
+            relato = relato_confirmado
+
+        task_status[f"checkout_{task_id}_relato"] = relato
+        verificar_cancelamento(chave, cancel_key, str(task_id), f"checkout_{task_id}")
 
         task_status[chave] = "checkout"
-        realizar_checkout_ui_invisivel(task_id, data_checkout or data_inicio, hora_checkout, relato)
+        realizar_checkout_ui_invisivel(task_id, data_checkout or data_inicio, hora_checkout, relato, cancel_key=cancel_key or chave)
 
         # Aguarda checkout
         for _ in range(30):
+            verificar_cancelamento(chave, cancel_key, f"checkout_{task_id}")
+            if task_status.get(f"checkout_{task_id}") == "cancelado":
+                raise ProcessoCancelado("Processo cancelado pelo usuário.")
             if task_status.get(f"checkout_{task_id}") == "done":
                 break
-            time.sleep(2)
+            dormir_com_cancelamento(2, chave, cancel_key, f"checkout_{task_id}")
 
+        verificar_cancelamento(chave, cancel_key, f"checkout_{task_id}")
         task_status[chave] = "done"
         task_status["full_flow_task_id"] = task_id
+        limpar_cancelamento(chave)
         print(f"✅ Fluxo completo concluído! Task #{task_id}")
+
+    except ProcessoCancelado:
+        task_status[chave] = "cancelado"
+        if task_id:
+            task_status[str(task_id)] = "cancelado"
+            task_status[f"checkout_{task_id}"] = "cancelado"
+        print(f"⛔ Fluxo completo cancelado para {empresa}.")
 
     except Exception as e:
         instavel = detectar_instabilidade_auvo(e) or "instabilidade" in str(e).lower()
         task_status[chave] = "auvo_instavel" if instavel else "erro"
         task_status[f"{chave}_mensagem"] = str(e)
         print(f"❌ Erro no fluxo combinado: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Confirmação de relato antes do check-out
+# ---------------------------------------------------------------------------
+def preparar_confirmacao_relato_checkout(task_id, data_checkout, hora_checkout, relato, cancel_key=None, flow_key=None, verificacao_equipamento=None):
+    status_key = f"checkout_{task_id}"
+    task_status[status_key] = "aguardando_confirmacao_relato"
+    task_status[f"{status_key}_relato"] = relato or RELATO_FALLBACK
+    task_status[f"{status_key}_data"] = data_checkout
+    task_status[f"{status_key}_hora"] = hora_checkout
+    task_status[f"{status_key}_cancel_key"] = cancel_key
+    task_status[f"{status_key}_verificacao_equipamento"] = verificacao_equipamento
+    if flow_key:
+        task_status[flow_key] = "aguardando_confirmacao_relato"
+        task_status[f"{flow_key}_checkout_key"] = status_key
+        task_status[f"{flow_key}_relato"] = relato or RELATO_FALLBACK
+        task_status[f"{flow_key}_data_checkout"] = data_checkout
+        task_status[f"{flow_key}_hora_checkout"] = hora_checkout
+        task_status[f"{flow_key}_task_id"] = task_id
+        task_status[f"{flow_key}_verificacao_equipamento"] = verificacao_equipamento
+    return {
+        "status": "confirmar_relato",
+        "task_id": task_id,
+        "status_key": status_key,
+        "flow_key": flow_key,
+        "relato": relato or RELATO_FALLBACK,
+        "data": data_checkout,
+        "hora": hora_checkout,
+        "verificacao_equipamento": verificacao_equipamento,
+    }
+
+
+def aguardar_confirmacao_relato_checkout(task_id, data_checkout, hora_checkout, relato, cancel_key=None, flow_key=None, verificacao_equipamento=None):
+    status_key = f"checkout_{task_id}"
+    preparar_confirmacao_relato_checkout(task_id, data_checkout, hora_checkout, relato, cancel_key=cancel_key, flow_key=flow_key, verificacao_equipamento=verificacao_equipamento)
+    while True:
+        verificar_cancelamento(flow_key, cancel_key, status_key)
+        if task_status.get(status_key) == "cancelado":
+            raise ProcessoCancelado("Processo cancelado pelo usuário.")
+        confirmado = task_status.get(f"{status_key}_relato_confirmado")
+        if confirmado is not None:
+            return confirmado
+        dormir_com_cancelamento(1, flow_key, cancel_key, status_key)
+
+
+def preparar_confirmacao_textos_fluxo(flow_key, descricao, relato):
+    task_status[flow_key] = "aguardando_confirmacao_textos"
+    task_status[f"{flow_key}_descricao"] = descricao or DESCRICAO_FALLBACK
+    task_status[f"{flow_key}_relato"] = relato or RELATO_FALLBACK
+
+
+def aguardar_confirmacao_textos_fluxo(flow_key, descricao, relato, cancel_key=None):
+    preparar_confirmacao_textos_fluxo(flow_key, descricao, relato)
+    while True:
+        verificar_cancelamento(flow_key, cancel_key)
+        confirmado = task_status.get(f"{flow_key}_textos_confirmados")
+        if isinstance(confirmado, dict):
+            return (
+                (confirmado.get("descricao") or descricao or DESCRICAO_FALLBACK).strip(),
+                (confirmado.get("relato") or relato or RELATO_FALLBACK).strip(),
+            )
+        dormir_com_cancelamento(1, flow_key, cancel_key)
 
 
 # ---------------------------------------------------------------------------
@@ -2721,14 +4113,46 @@ class AuvoHandler(BaseHTTPRequestHandler):
             status  = task_status.get(task_id, "pending")
             extra   = {}
 
-            # Passa task_id do fluxo completo, se houver
-            if task_id.startswith("full_flow_") and "full_flow_task_id" in task_status:
-                extra["task_id"] = task_status["full_flow_task_id"]
+            # Passa dados do fluxo completo, se houver
+            if task_id.startswith("full_flow_"):
+                if f"{task_id}_task_id" in task_status:
+                    extra["task_id"] = task_status[f"{task_id}_task_id"]
+                elif "full_flow_task_id" in task_status:
+                    extra["task_id"] = task_status["full_flow_task_id"]
+                for origem, destino in [
+                    (f"{task_id}_checkout_key", "status_key"),
+                    (f"{task_id}_relato", "relato"),
+                    (f"{task_id}_data_checkout", "data"),
+                    (f"{task_id}_hora_checkout", "hora"),
+                    (f"{task_id}_verificacao_equipamento", "verificacao_equipamento"),
+                ]:
+                    if origem in task_status:
+                        extra[destino] = task_status[origem]
+
+            if task_id.startswith("checkout_"):
+                for origem, destino in [
+                    (f"{task_id}_relato", "relato"),
+                    (f"{task_id}_data", "data"),
+                    (f"{task_id}_hora", "hora"),
+                ]:
+                    if origem in task_status:
+                        extra[destino] = task_status[origem]
+
+            if task_id.startswith("full_flow_"):
+                for origem, destino in [
+                    (f"{task_id}_descricao", "descricao"),
+                    (f"{task_id}_relato", "relato"),
+                ]:
+                    if origem in task_status:
+                        extra[destino] = task_status[origem]
 
             # Passa mensagem de erro, se houver
             msg_key = f"{task_id}_mensagem"
             if msg_key in task_status:
                 extra["mensagem"] = task_status[msg_key]
+
+            if cancelamento_solicitado(task_id):
+                status = "cancelado"
 
             self.send_response(200)
             self.send_header("Content-type",                "application/json")
@@ -2737,8 +4161,151 @@ class AuvoHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"status": status, **extra}).encode())
 
     def do_POST(self):
+        # ── CANCELAMENTO ────────────────────────────────────────────────────
+        if self.path == "/cancel":
+            try:
+                content_length = int(self.headers.get('Content-Length', 0) or 0)
+                dados = json.loads(self.rfile.read(content_length) or b"{}")
+                chave = dados.get("chave") or dados.get("key") or dados.get("task_id")
+                if not solicitar_cancelamento(chave):
+                    raise Exception("Chave de processo inválida para cancelamento.")
+                resposta = {"status": "ok", "chave": str(chave)}
+            except Exception as e:
+                resposta = {"status": "erro", "mensagem": str(e)}
+            self._enviar_json(resposta)
+
+        # ── CONFIRMAR RELATO DO CHECK-OUT ──────────────────────────────────
+        elif self.path == "/auvo-checkout-confirmar":
+            try:
+                content_length = int(self.headers.get('Content-Length', 0) or 0)
+                dados = json.loads(self.rfile.read(content_length) or b"{}")
+                task_id = int(dados.get("task_id"))
+                status_key = dados.get("status_key") or f"checkout_{task_id}"
+                flow_key = dados.get("flow_key")
+                relato = (dados.get("relato") or "").strip()
+                data_checkout = dados.get("data") or dados.get("data_checkout") or task_status.get(f"{status_key}_data")
+                hora_checkout = dados.get("hora") or dados.get("hora_checkout") or task_status.get(f"{status_key}_hora")
+                cancel_key = dados.get("cancel_key") or task_status.get(f"{status_key}_cancel_key")
+
+                if not relato:
+                    raise Exception("Relato vazio. Revise o texto antes de confirmar o check-out.")
+                if not data_checkout or not hora_checkout:
+                    raise Exception("Data ou hora do check-out não encontrada.")
+
+                task_status[f"{status_key}_relato_confirmado"] = relato
+                task_status[f"{status_key}_relato"] = relato
+                task_status[status_key] = "relato_ok"
+
+                if flow_key:
+                    task_status[f"{flow_key}_relato"] = relato
+                    task_status[flow_key] = "checkout"
+                else:
+                    threading.Thread(
+                        target=realizar_checkout_ui_invisivel,
+                        args=(task_id, data_checkout, hora_checkout, relato, cancel_key)
+                    ).start()
+
+                resposta = {"status": "ok", "task_id": task_id, "status_key": status_key, "hora": hora_checkout, "data": data_checkout}
+
+            except ProcessoCancelado as e:
+                resposta = {"status": "cancelado", "mensagem": str(e)}
+
+            except Exception as e:
+                instavel = detectar_instabilidade_auvo(e) or "instabilidade" in str(e).lower()
+                print("❌ Erro ao confirmar relato do checkout:", e)
+                resposta = {
+                    "status": "auvo_instavel" if instavel else "erro",
+                    "mensagem": str(e)
+                }
+
+            self._enviar_json(resposta)
+
+        # ── SELECIONAR EQUIPAMENTO (quando a IA não identificou qual é) ────
+        elif self.path == "/auvo-checkout-selecionar-equipamento":
+            try:
+                content_length = int(self.headers.get('Content-Length', 0) or 0)
+                dados = json.loads(self.rfile.read(content_length) or b"{}")
+                codigo_cliente = dados.get("codigo_cliente")
+                status_key = dados.get("status_key")
+                task_id = dados.get("task_id")
+                empresa = (dados.get("empresa") or "").strip()
+                equipamento_selecionado = (dados.get("equipamento") or "").strip()
+                relato_editado = (dados.get("relato") or "").strip()
+
+                if not codigo_cliente:
+                    raise Exception("codigo_cliente não informado.")
+                if not equipamento_selecionado:
+                    raise Exception("Nenhum equipamento informado/selecionado.")
+
+                contexto = task_status.get(f"checkout_contexto_{codigo_cliente}") or {}
+                if task_id:
+                    contexto["task_id"] = task_id
+                relato_atual = relato_editado or contexto.get("relato") or (task_status.get(f"{status_key}_relato") if status_key else None) or RELATO_FALLBACK
+                problema_equipamento = contexto.get("problema_equipamento") or ""
+                nome_cliente = empresa or contexto.get("empresa") or ""
+
+                token = autenticar()
+                equipamentos_cliente = buscar_equipamentos_cliente(token, codigo_cliente)
+                nome_oficial = aplicar_apelido_equipamento(equipamento_selecionado)
+                vinculado = equipamento_esta_vinculado(nome_oficial, equipamentos_cliente)
+
+                if not vinculado:
+                    gravar_equipamento_nao_vinculado(nome_cliente, nome_oficial, task_id or contexto.get("task_id") or "")
+
+                relato_atualizado = inserir_linha_equipamento(relato_atual, nome_oficial, problema_equipamento)
+
+                contexto["relato"] = relato_atualizado
+                contexto["verificacao_equipamento"] = {
+                    "status": "vinculado" if vinculado else "nao_vinculado",
+                    "equipamento": nome_oficial,
+                }
+                task_status[f"checkout_contexto_{codigo_cliente}"] = contexto
+                if status_key:
+                    task_status[f"{status_key}_relato"] = relato_atualizado
+
+                resposta = {
+                    "status": "ok",
+                    "relato": relato_atualizado,
+                    "equipamento": nome_oficial,
+                    "vinculado": vinculado,
+                }
+
+            except Exception as e:
+                print("❌ Erro ao selecionar equipamento:", e)
+                resposta = {"status": "erro", "mensagem": str(e)}
+
+            self._enviar_json(resposta)
+
+        # ── CONFIRMAR TEXTOS DO FLUXO COMPLETO ─────────────────────────────
+        elif self.path == "/auvo-checkout-criar-confirmar-textos":
+            try:
+                content_length = int(self.headers.get('Content-Length', 0) or 0)
+                dados = json.loads(self.rfile.read(content_length) or b"{}")
+                flow_key = dados.get("flow_key")
+                descricao = (dados.get("descricao") or "").strip()
+                relato = (dados.get("relato") or "").strip()
+                if not flow_key:
+                    raise Exception("Chave do fluxo não informada.")
+                if not descricao:
+                    raise Exception("Descrição vazia. Revise antes de confirmar.")
+                if not relato:
+                    raise Exception("Relato vazio. Revise antes de confirmar.")
+                task_status[f"{flow_key}_textos_confirmados"] = {
+                    "descricao": descricao,
+                    "relato": relato,
+                }
+                task_status[f"{flow_key}_descricao"] = descricao
+                task_status[f"{flow_key}_relato"] = relato
+                task_status[flow_key] = "criando_task"
+                resposta = {"status": "ok", "flow_key": flow_key}
+            except ProcessoCancelado as e:
+                resposta = {"status": "cancelado", "mensagem": str(e)}
+            except Exception as e:
+                resposta = {"status": "erro", "mensagem": str(e)}
+            self._enviar_json(resposta)
+
         # ── CHECK-IN ────────────────────────────────────────────────────────
-        if self.path == "/auvo":
+        elif self.path == "/auvo":
             try:
                 inicio = time.time()
                 content_length = int(self.headers['Content-Length'])
@@ -2746,8 +4313,13 @@ class AuvoHandler(BaseHTTPRequestHandler):
                 empresa        = dados.get("empresa", "")
                 codigo_cliente = dados.get("codigo_cliente")
                 inicio_escolhido = dados.get("inicio_escolhido")
+                sistema_cliente = dados.get("sistema")
+                cancel_key = dados.get("cancel_key")
+                if cancel_key:
+                    limpar_cancelamento(cancel_key)
 
                 print(f"\n>> Novo Lançamento: {empresa} | Usuário: {NOME_USER} (ID: {ID_USER})")
+                print(f">> Sistema capturado: {sistema_cliente or '<nenhum>'}")
 
                 codigo_cliente, opcoes_empresas = resolver_cliente_para_requisicao(empresa, codigo_cliente)
                 if not codigo_cliente:
@@ -2761,6 +4333,7 @@ class AuvoHandler(BaseHTTPRequestHandler):
                     raise Exception(f"Cliente '{empresa}' não encontrado.")
 
                 mensagens    = pegar_mensagens_chat()
+                verificar_cancelamento(cancel_key)
 
                 if inicio_escolhido:
                     hora_chat = inicio_escolhido.get("hora")
@@ -2781,27 +4354,23 @@ class AuvoHandler(BaseHTTPRequestHandler):
                 if not hora_chat:
                     raise Exception("Hora de início não encontrada no chat.")
 
-                token_resultado = [None]
-                token_erro = [None]
-
-                def obter_token_auvo():
-                    try:
-                        token_resultado[0] = autenticar()
-                    except Exception as erro_token:
-                        token_erro[0] = erro_token
-
-                thread_token = threading.Thread(target=obter_token_auvo)
-                thread_token.start()
+                token = autenticar()
+                verificar_cancelamento(cancel_key)
+                segmento = verificar_segmento_cliente(
+                    token,
+                    codigo_cliente,
+                    continuar_sem_segmento=bool(dados.get("continuar_sem_segmento")),
+                    continuar_sem_contrato=bool(dados.get("continuar_sem_contrato"))
+                )
+                if not segmento.get("ok"):
+                    self._enviar_json(resposta_cliente_sem_segmento(empresa, codigo_cliente, segmento.get("status")))
+                    return
 
                 print("🤖 Gerando descrição com IA...")
-                descricao_ia = gerar_descricao_com_ia(mensagens)
+                verificar_cancelamento(cancel_key)
+                descricao_ia = gerar_descricao_com_ia(mensagens, sistema_cliente)
                 print(f"📝 Descrição:\n{descricao_ia}\n")
 
-                thread_token.join()
-                if token_erro[0]:
-                    raise token_erro[0]
-
-                token   = token_resultado[0]
                 task_id = criar_atendimento_com_checkin(
                     token        = token,
                     customer_id  = codigo_cliente,
@@ -2813,12 +4382,16 @@ class AuvoHandler(BaseHTTPRequestHandler):
                 )
 
                 print(f">> Task #{task_id} criada ({data_chat} {hora_chat}). Iniciando Check-in...")
+                limpar_cancelamento(str(task_id))
                 threading.Thread(
                     target=realizar_checkin_ui_invisivel,
-                    args=(task_id, data_chat, hora_chat, inicio)
+                    args=(task_id, data_chat, hora_chat, inicio, cancel_key)
                 ).start()
 
                 resposta = {"status": "ok", "task_id": task_id, "descricao": descricao_ia, "empresa": empresa, "codigo_cliente": codigo_cliente}
+
+            except ProcessoCancelado as e:
+                resposta = {"status": "cancelado", "mensagem": str(e)}
 
             except Exception as e:
                 instavel = detectar_instabilidade_auvo(e) or "instabilidade" in str(e).lower()
@@ -2838,6 +4411,9 @@ class AuvoHandler(BaseHTTPRequestHandler):
                 empresa   = dados.get("empresa", "")
                 # Quando o usuário já escolheu a task (veio do seletor), usamos direto
                 task_id_escolhido = dados.get("task_id_escolhido")
+                cancel_key = dados.get("cancel_key")
+                if cancel_key:
+                    limpar_cancelamento(cancel_key)
 
                 print(f"\n>> Check-out por empresa: {empresa} | Usuário: {NOME_USER}")
 
@@ -2853,38 +4429,65 @@ class AuvoHandler(BaseHTTPRequestHandler):
                         return
                     raise Exception(f"Cliente '{empresa}' não encontrado.")
 
+                contexto_checkout = task_status.get(f"checkout_contexto_{codigo_cliente}") if codigo_cliente else None
+                confirmou_task_checkout = bool(dados.get("confirmar_task_checkout"))
+                if task_id_escolhido and confirmou_task_checkout and isinstance(contexto_checkout, dict):
+                    task_id = int(task_id_escolhido)
+                    contexto_checkout["task_id"] = task_id
+                    relato = contexto_checkout.get("relato") or RELATO_FALLBACK
+                    hora_checkout = contexto_checkout.get("hora_checkout")
+                    data_checkout = contexto_checkout.get("data_checkout")
+                    verificacao_equipamento = contexto_checkout.get("verificacao_equipamento")
+                    if isinstance(verificacao_equipamento, dict) and verificacao_equipamento.get("registro_pendente"):
+                        gravar_equipamento_nao_vinculado(
+                            contexto_checkout.get("empresa") or empresa,
+                            verificacao_equipamento.get("equipamento") or "",
+                            task_id,
+                        )
+                        verificacao_equipamento["registrado"] = True
+                        verificacao_equipamento["registro_pendente"] = False
+                    if not hora_checkout:
+                        raise Exception("Hora de checkout não encontrada no contexto reaproveitado.")
+                    limpar_cancelamento(f"checkout_{task_id}")
+                    resposta = preparar_confirmacao_relato_checkout(
+                        task_id,
+                        data_checkout,
+                        hora_checkout,
+                        relato,
+                        cancel_key=cancel_key,
+                        verificacao_equipamento=verificacao_equipamento,
+                    )
+                    resposta["codigo_cliente"] = codigo_cliente
+                    resposta["empresa"] = empresa
+                    self._enviar_json(resposta)
+                    return
+
                 mensagens      = pegar_mensagens_chat()
+                verificar_cancelamento(cancel_key)
                 hora_checkout, data_checkout = pegar_hora_e_data_ultima_mensagem(mensagens)
                 if not hora_checkout:
                     raise Exception("Hora de checkout não encontrada no chat.")
 
                 relato_resultado = [None]
-                tasks_resultado  = [None]
-                erro_busca       = [None]
+                equipamento_relacionado_resultado = [False]
+                equipamento_citado_resultado = [""]
+                problema_equipamento_resultado = [""]
 
                 def gerar_relato():
                     print("🤖 Gerando relato detalhado com IA...")
-                    relato_resultado[0] = gerar_relato_com_ia(mensagens)
+                    (relato_resultado[0], equipamento_relacionado_resultado[0],
+                     equipamento_citado_resultado[0], problema_equipamento_resultado[0]) = gerar_relato_estruturado_com_ia(mensagens)
                     print(f"📝 Relato:\n{relato_resultado[0]}\n")
 
-                def buscar_tasks():
-                    try:
-                        token = autenticar()
-                        tasks_resultado[0] = buscar_tasks_abertas(token, str(codigo_cliente))
-                    except Exception as e:
-                        erro_busca[0] = e
+                # ── Primeiro verifica no Auvo se existe task aberta ───────────
+                # (antes de gastar tokens gerando o relato com IA). Se não
+                # existir, o usuário vai para o fluxo combinado, que gera seu
+                # próprio texto — gerar aqui também seria desperdício.
+                token = autenticar()
+                tasks_resultado = buscar_tasks_abertas(token, str(codigo_cliente))
+                verificar_cancelamento(cancel_key)
 
-                t1 = threading.Thread(target=gerar_relato)
-                t2 = threading.Thread(target=buscar_tasks)
-                t1.start(); t2.start()
-                t1.join(); t2.join()
-
-                # Propaga erros de instabilidade da busca
-                if erro_busca[0]:
-                    raise erro_busca[0]
-
-                resultado_tasks = tasks_resultado[0] or []
-                if isinstance(resultado_tasks, dict) and resultado_tasks.get("status") == "atendimento_pausado":
+                if isinstance(tasks_resultado, dict) and tasks_resultado.get("status") == "atendimento_pausado":
                     self._enviar_json({
                         "status": "atendimento_pausado",
                         "codigo_cliente": codigo_cliente,
@@ -2893,32 +4496,79 @@ class AuvoHandler(BaseHTTPRequestHandler):
                     })
                     return
 
-                tasks = resultado_tasks
+                tasks = tasks_resultado or []
 
                 # ── Sem task aberta: sugere criar checkin + checkout ──────────
+                # Não gera relato com IA aqui — economiza a chamada, já que o
+                # fluxo combinado (checkin + checkout) vai gerar seu próprio texto.
                 if not tasks:
                     self._enviar_json({
                         "status":         "sem_atendimento",
                         "codigo_cliente": codigo_cliente,
-                        "mensagem":       f"Nenhuma task encontrada hoje para '{empresa}'.",
+                        "mensagem":       f"Nenhuma task encontrada nos últimos 10 dias para '{empresa}'.",
                     })
                     return
 
-                # ── Múltiplas tasks: pede que o usuário escolha ───────────────
-                if len(tasks) > 1 and not task_id_escolhido:
-                    # Guarda o relato já gerado para reaproveitar quando a escolha chegar
+                # ── Task(s) encontrada(s): agora sim vale a pena gerar o relato ──
+                gerar_relato()
+
+                # ── Verifica se o atendimento é sobre equipamento e, se for,
+                # se o equipamento citado está cadastrado pro cliente no Auvo ──
+                task_id_verificacao = task_id_escolhido or (tasks[0].get("taskID") if len(tasks) == 1 else "")
+                verificacao_equipamento = verificar_equipamento_checkout(
+                    token,
+                    codigo_cliente,
+                    empresa,
+                    equipamento_relacionado_resultado[0],
+                    equipamento_citado_resultado[0],
+                    task_id_verificacao,
+                )
+
+                task_status[f"checkout_contexto_{codigo_cliente}"] = {
+                    "mensagens": mensagens,
+                    "relato": relato_resultado[0],
+                    "hora_checkout": hora_checkout,
+                    "data_checkout": data_checkout,
+                    "empresa": empresa,
+                    "sistema": dados.get("sistema"),
+                    "equipamento_relacionado": equipamento_relacionado_resultado[0],
+                    "equipamento_citado": equipamento_citado_resultado[0],
+                    "problema_equipamento": problema_equipamento_resultado[0],
+                    "verificacao_equipamento": verificacao_equipamento,
+                    "task_id": task_id_verificacao,
+                }
+
+
+                if not task_id_escolhido:
                     chave_relato = f"relato_pendente_{codigo_cliente}"
                     task_status[chave_relato] = relato_resultado[0]
+                    if len(tasks) > 1:
+                        self._enviar_json({
+                            "status":         "multiplas_tasks",
+                            "tasks":          tasks,
+                            "hora":           hora_checkout,
+                            "codigo_cliente": codigo_cliente,
+                            "empresa":        empresa,
+                            "verificacao_equipamento": verificacao_equipamento,
+                        })
+                        return
+
                     self._enviar_json({
-                        "status":         "multiplas_tasks",
-                        "tasks":          tasks,
+                        "status":         "confirmar_task_checkout",
+                        "task":           tasks[0],
+                        "task_id":        tasks[0]["taskID"],
                         "hora":           hora_checkout,
+                        "data":           data_checkout,
                         "codigo_cliente": codigo_cliente,
                         "empresa":        empresa,
+                        "verificacao_equipamento": verificacao_equipamento,
                     })
                     return
 
-                # ── Task única ou já escolhida pelo usuário ───────────────────
+                if task_id_escolhido and not confirmou_task_checkout:
+                    raise Exception("Confirme se deseja lançar o check-out nesta task ou criar um fluxo novo.")
+
+                # ── Task escolhida e confirmada pelo usuário ──────────────────
                 if task_id_escolhido:
                     task_id = int(task_id_escolhido)
                     # Tenta reutilizar relato já gerado (economiza chamada ao Gemini)
@@ -2928,14 +4578,20 @@ class AuvoHandler(BaseHTTPRequestHandler):
                     task_id = tasks[0]["taskID"]
                     relato  = relato_resultado[0]
 
-                task_status[f"checkout_{task_id}"] = "relato_ok"
+                limpar_cancelamento(f"checkout_{task_id}")
+                resposta = preparar_confirmacao_relato_checkout(
+                    task_id,
+                    data_checkout,
+                    hora_checkout,
+                    relato,
+                    cancel_key=cancel_key,
+                    verificacao_equipamento=verificacao_equipamento,
+                )
+                resposta["codigo_cliente"] = codigo_cliente
+                resposta["empresa"] = empresa
 
-                threading.Thread(
-                    target=realizar_checkout_ui_invisivel,
-                    args=(task_id, data_checkout, hora_checkout, relato)
-                ).start()
-
-                resposta = {"status": "ok", "task_id": task_id, "hora": hora_checkout, "data": data_checkout}
+            except ProcessoCancelado as e:
+                resposta = {"status": "cancelado", "mensagem": str(e)}
 
             except Exception as e:
                 instavel = detectar_instabilidade_auvo(e) or "instabilidade" in str(e).lower()
@@ -2958,6 +4614,9 @@ class AuvoHandler(BaseHTTPRequestHandler):
                 data_pausa = (dados.get("data_pausa") or "").strip()
                 hora_pausa = (dados.get("hora_pausa") or "").strip()
                 motivo = (dados.get("motivo") or "").strip()
+                cancel_key = dados.get("cancel_key")
+                if cancel_key:
+                    limpar_cancelamento(cancel_key)
 
                 print(f"\n>> Início da pausa por empresa: {empresa} | Usuário: {NOME_USER}")
 
@@ -2983,8 +4642,10 @@ class AuvoHandler(BaseHTTPRequestHandler):
                         return
                     raise Exception(f"Cliente '{empresa}' não encontrado.")
 
+                verificar_cancelamento(cancel_key)
                 token = autenticar()
                 resultado_tasks = buscar_tasks_abertas(token, str(codigo_cliente))
+                verificar_cancelamento(cancel_key)
                 if isinstance(resultado_tasks, dict) and resultado_tasks.get("status") == "atendimento_pausado":
                     self._enviar_json({
                         "status": "atendimento_pausado",
@@ -3013,11 +4674,12 @@ class AuvoHandler(BaseHTTPRequestHandler):
                     return
 
                 task_id = int(task_id_escolhido) if task_id_escolhido else tasks[0]["taskID"]
+                limpar_cancelamento(f"pausa_{task_id}")
                 task_status[f"pausa_{task_id}"] = "iniciando"
 
                 threading.Thread(
                     target=realizar_inicio_pausa_ui_invisivel,
-                    args=(task_id, data_pausa, hora_pausa, motivo)
+                    args=(task_id, data_pausa, hora_pausa, motivo, cancel_key)
                 ).start()
 
                 resposta = {
@@ -3028,6 +4690,9 @@ class AuvoHandler(BaseHTTPRequestHandler):
                     "hora": hora_pausa,
                     "motivo": motivo,
                 }
+
+            except ProcessoCancelado as e:
+                resposta = {"status": "cancelado", "mensagem": str(e)}
 
             except Exception as e:
                 instavel = detectar_instabilidade_auvo(e) or "instabilidade" in str(e).lower()
@@ -3049,6 +4714,9 @@ class AuvoHandler(BaseHTTPRequestHandler):
                 task_id_escolhido = dados.get("task_id_escolhido")
                 data_pausa = (dados.get("data_pausa") or dados.get("data_despausa") or "").strip()
                 hora_pausa = (dados.get("hora_pausa") or dados.get("hora_despausa") or "").strip()
+                cancel_key = dados.get("cancel_key")
+                if cancel_key:
+                    limpar_cancelamento(cancel_key)
 
                 print(f"\n>> Fim da pausa por empresa: {empresa} | Usuário: {NOME_USER}")
 
@@ -3072,8 +4740,10 @@ class AuvoHandler(BaseHTTPRequestHandler):
                         return
                     raise Exception(f"Cliente '{empresa}' não encontrado.")
 
+                verificar_cancelamento(cancel_key)
                 token = autenticar()
                 tasks = buscar_tasks_pausadas(token, str(codigo_cliente)) or []
+                verificar_cancelamento(cancel_key)
                 if not tasks:
                     self._enviar_json({
                         "status": "sem_atendimento",
@@ -3092,11 +4762,12 @@ class AuvoHandler(BaseHTTPRequestHandler):
                     return
 
                 task_id = int(task_id_escolhido) if task_id_escolhido else tasks[0]["taskID"]
+                limpar_cancelamento(f"despausa_{task_id}")
                 task_status[f"despausa_{task_id}"] = "iniciando"
 
                 threading.Thread(
                     target=realizar_fim_pausa_ui_invisivel,
-                    args=(task_id, data_pausa, hora_pausa)
+                    args=(task_id, data_pausa, hora_pausa, cancel_key)
                 ).start()
 
                 resposta = {
@@ -3106,6 +4777,9 @@ class AuvoHandler(BaseHTTPRequestHandler):
                     "data": data_pausa,
                     "hora": hora_pausa,
                 }
+
+            except ProcessoCancelado as e:
+                resposta = {"status": "cancelado", "mensagem": str(e)}
 
             except Exception as e:
                 instavel = detectar_instabilidade_auvo(e) or "instabilidade" in str(e).lower()
@@ -3123,6 +4797,11 @@ class AuvoHandler(BaseHTTPRequestHandler):
                 empresa        = dados.get("empresa", "")
                 codigo_cliente = dados.get("codigo_cliente")
                 inicio_escolhido = dados.get("inicio_escolhido")
+                sistema_cliente = dados.get("sistema")
+                cancel_key = dados.get("cancel_key")
+                if cancel_key:
+                    limpar_cancelamento(cancel_key)
+                print(f">> Sistema capturado: {sistema_cliente or '<nenhum>'}")
 
                 codigo_cliente, opcoes_empresas = resolver_cliente_para_requisicao(empresa, codigo_cliente)
                 if not codigo_cliente:
@@ -3135,7 +4814,13 @@ class AuvoHandler(BaseHTTPRequestHandler):
                         return
                     raise Exception(f"Cliente '{empresa}' não encontrado.")
 
-                mensagens = pegar_mensagens_chat()
+                contexto_checkout = task_status.get(f"checkout_contexto_{codigo_cliente}") if codigo_cliente else None
+                if isinstance(contexto_checkout, dict) and contexto_checkout.get("mensagens"):
+                    mensagens = contexto_checkout.get("mensagens") or []
+                    print("♻️ Reaproveitando chat já capturado para o fluxo completo.")
+                else:
+                    mensagens = pegar_mensagens_chat()
+                verificar_cancelamento(cancel_key)
                 if not inicio_escolhido:
                     opcoes_inicio = encontrar_opcoes_inicio_atendimento(mensagens)
                     print(f">> Inícios de atendimento encontrados: {len(opcoes_inicio)}")
@@ -3148,12 +4833,24 @@ class AuvoHandler(BaseHTTPRequestHandler):
                         })
                         return
 
+                token = autenticar()
+                segmento = verificar_segmento_cliente(
+                    token,
+                    codigo_cliente,
+                    continuar_sem_segmento=bool(dados.get("continuar_sem_segmento")),
+                    continuar_sem_contrato=bool(dados.get("continuar_sem_contrato"))
+                )
+                if not segmento.get("ok"):
+                    self._enviar_json(resposta_cliente_sem_segmento(empresa, codigo_cliente, segmento.get("status")))
+                    return
+
                 chave     = f"full_flow_{codigo_cliente}"
+                limpar_cancelamento(chave)
                 task_status[chave] = "iniciando"
 
                 threading.Thread(
                     target=fluxo_checkin_e_checkout,
-                    args=(empresa, mensagens, codigo_cliente, inicio_escolhido)
+                    args=(empresa, mensagens, codigo_cliente, inicio_escolhido, sistema_cliente, cancel_key)
                 ).start()
 
                 resposta = {
@@ -3161,6 +4858,9 @@ class AuvoHandler(BaseHTTPRequestHandler):
                     "flow_key":       chave,
                     "codigo_cliente": codigo_cliente,
                 }
+
+            except ProcessoCancelado as e:
+                resposta = {"status": "cancelado", "mensagem": str(e)}
 
             except Exception as e:
                 instavel = detectar_instabilidade_auvo(e) or "instabilidade" in str(e).lower()
@@ -3194,75 +4894,204 @@ SCRIPT_BOTAO = r"""
 (function() {
     // ── Notificação flutuante ─────────────────────────────────────────────
     function mostrarNotificacao(mensagem, tipo, acoes) {
+        if (window.auvoNotificacaoLimpar) {
+            try { window.auvoNotificacaoLimpar(); } catch (e) {}
+            window.auvoNotificacaoLimpar = null;
+        }
         const existente = document.getElementById('auvo-notif');
         if (existente) existente.remove();
+        const barraExistente = document.getElementById('auvo-notif-bar');
+        if (barraExistente) barraExistente.remove();
 
         const notif = document.createElement('div');
         notif.id = 'auvo-notif';
-        const cores = { info: '#2980b9', aviso: '#e67e22', erro: '#e74c3c', sucesso: '#27ae60' };
+
+        const tema = {
+            info:    { cor: '#3498db', titulo: 'Informação Auvo', icone: 'i' },
+            aviso:   { cor: '#f39c12', titulo: 'Atenção Auvo', icone: '!' },
+            erro:    { cor: '#e74c3c', titulo: 'Erro Auvo', icone: '!' },
+            sucesso: { cor: '#2ee86f', titulo: 'PROCESSO CONCLUÍDO', icone: '✓' },
+        }[tipo] || { cor: '#3498db', titulo: 'Aviso Auvo', icone: 'i' };
+        const temAcoes = !!(acoes && acoes.length);
+        let barraTopo = null;
+        let ajustarBarra = null;
+
         Object.assign(notif.style, {
-            position: 'fixed', bottom: '24px', right: '24px', zIndex: '99999',
-            background: cores[tipo] || '#2980b9', color: 'white',
-            borderRadius: '10px', padding: '16px 20px', maxWidth: '360px',
-            boxShadow: '0 6px 24px rgba(0,0,0,0.25)', fontFamily: 'sans-serif',
-            fontSize: '14px', lineHeight: '1.5',
-            animation: 'auvoSlideIn 0.3s ease',
+            position: 'fixed', zIndex: '2147483647',
+            width: temAcoes ? 'min(520px, calc(100vw - 32px))' : 'min(340px, calc(100vw - 32px))',
+            boxSizing: 'border-box',
+            background: 'rgba(42,44,46,0.97)',
+            color: '#f5f7f8', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.12)',
+            padding: temAcoes ? '10px 36px 10px 12px' : '8px 34px 8px 12px',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.45)',
+            fontFamily: 'Arial, sans-serif', fontSize: '13px', lineHeight: '1.25',
+            letterSpacing: '0', whiteSpace: 'pre-line',
+            animation: 'auvoToastIn 0.18s ease-out',
+            top: '-9999px', left: '-9999px',
         });
 
-        // CSS de animação (injeta uma vez)
-        if (!document.getElementById('auvo-style')) {
-            const style = document.createElement('style');
+        // CSS de animacao
+        let style = document.getElementById('auvo-style');
+        if (!style) {
+            style = document.createElement('style');
             style.id = 'auvo-style';
-            style.textContent = `
-                @keyframes auvoSlideIn {
-                    from { opacity:0; transform:translateY(20px); }
-                    to   { opacity:1; transform:translateY(0); }
-                }
-            `;
             document.head.appendChild(style);
         }
+        style.textContent = `
+            @keyframes auvoToastIn {
+                from { opacity:0; transform:translateY(-6px) scale(0.98); }
+                to   { opacity:1; transform:translateY(0) scale(1); }
+            }
+            #auvo-notif::before { display: none !important; content: none !important; }
+        `;
+
+        function medirAreaBotoesAuvo() {
+            const ids = ['botao-auvo', 'botao-auvo-checkout', 'botao-auvo-pausa', 'botao-auvo-despausa'];
+            const rects = ids
+                .map(id => document.getElementById(id))
+                .filter(btn => btn && btn.offsetParent !== null)
+                .map(btn => btn.getBoundingClientRect())
+                .filter(r => r.width > 0 && r.height > 0);
+
+            if (!rects.length) return null;
+            return rects.reduce((acc, r) => ({
+                left: Math.min(acc.left, r.left),
+                right: Math.max(acc.right, r.right),
+                bottom: Math.max(acc.bottom, r.bottom),
+            }), { left: rects[0].left, right: rects[0].right, bottom: rects[0].bottom });
+        }
+
+        function fecharNotificacao() {
+            if (barraTopo) barraTopo.remove();
+            if (ajustarBarra) window.removeEventListener('resize', ajustarBarra);
+            if (notif.parentNode) notif.remove();
+            if (window.auvoNotificacaoLimpar === fecharNotificacao) window.auvoNotificacaoLimpar = null;
+        }
+        window.auvoNotificacaoLimpar = fecharNotificacao;
+
+        // Posiciona o popup colado embaixo dos botões Auvo
+        ajustarBarra = () => {
+            const area = medirAreaBotoesAuvo();
+            if (!area) {
+                // fallback: centro do topo
+                notif.style.top = '80px';
+                notif.style.left = '50%';
+                notif.style.transform = 'translateX(-50%)';
+                return;
+            }
+            const margem = 8;
+            const notifW = notif.offsetWidth || 340;
+            // alinha o popup pelo centro do grupo de botões
+            let left = area.left + (area.right - area.left) / 2 - notifW / 2;
+            // mantém dentro da viewport
+            left = Math.max(margem, Math.min(window.innerWidth - notifW - margem, left));
+            const top = area.bottom + 8;
+            notif.style.top = `${top}px`;
+            notif.style.left = `${left}px`;
+            notif.style.transform = 'none';
+        };
+        // Roda após render para ter offsetWidth correto
+        requestAnimationFrame(() => { ajustarBarra(); });
+        window.addEventListener('resize', ajustarBarra);
+
+        const conteudo = document.createElement('div');
+        Object.assign(conteudo.style, { display: 'flex', alignItems: 'center', gap: '8px' });
+
+        const icone = document.createElement('span');
+        icone.textContent = tema.icone;
+        Object.assign(icone.style, {
+            width: '28px', height: '28px', borderRadius: '50%', display: 'inline-flex',
+            alignItems: 'center', justifyContent: 'center', color: tema.cor,
+            border: `2px solid ${tema.cor}`, fontSize: '16px', fontWeight: '800',
+            lineHeight: '1', flex: '0 0 auto', boxSizing: 'border-box',
+        });
+
+        const textoWrapper = document.createElement('div');
+        Object.assign(textoWrapper.style, { minWidth: '0', flex: '1 1 auto' });
+
+        const titulo = document.createElement('strong');
+        titulo.textContent = tema.titulo;
+        Object.assign(titulo.style, {
+            display: 'block', color: '#ffffff', fontSize: '13px', lineHeight: '1.1',
+            fontWeight: '700', marginBottom: '2px', letterSpacing: '0.3px',
+        });
+        textoWrapper.appendChild(titulo);
 
         const texto = document.createElement('div');
         texto.textContent = mensagem;
-        notif.appendChild(texto);
+        Object.assign(texto.style, {
+            color: '#a0a8b0', fontWeight: '400', fontSize: '11px', overflowWrap: 'anywhere',
+        });
+        textoWrapper.appendChild(texto);
 
-        if (acoes && acoes.length) {
+        conteudo.appendChild(icone);
+        conteudo.appendChild(textoWrapper);
+        notif.appendChild(conteudo);
+
+        const tituloNativo = tema.titulo;
+        try {
+            const tituloOriginal = document.title;
+            let alternar = false;
+            if (window.auvoTituloIntervalo) clearInterval(window.auvoTituloIntervalo);
+            window.auvoTituloIntervalo = setInterval(() => {
+                alternar = !alternar;
+                document.title = alternar ? `AUVO: ${tituloNativo}` : tituloOriginal;
+            }, 900);
+            setTimeout(() => {
+                clearInterval(window.auvoTituloIntervalo);
+                window.auvoTituloIntervalo = null;
+                document.title = tituloOriginal;
+            }, 14000);
+        } catch (e) {}
+
+        try {
+            if ('Notification' in window) {
+                const mostrarNativa = () => {
+                    if (Notification.permission === 'granted') {
+                        new Notification(tituloNativo, { body: String(mensagem || '').replace(/\s+/g, ' ').slice(0, 180), silent: false });
+                    }
+                };
+                if (Notification.permission === 'granted') mostrarNativa();
+                else if (Notification.permission === 'default') Notification.requestPermission().then(mostrarNativa).catch(() => {});
+            }
+        } catch (e) {}
+
+        if (temAcoes) {
             const btnWrapper = document.createElement('div');
-            Object.assign(btnWrapper.style, { marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap' });
+            Object.assign(btnWrapper.style, { marginTop: '14px', display: 'flex', gap: '8px', flexWrap: 'wrap', paddingLeft: '70px' });
 
             acoes.forEach(({ label, cor, callback }) => {
                 const btn = document.createElement('button');
                 btn.textContent = label;
                 Object.assign(btn.style, {
-                    padding: '6px 14px', border: 'none', borderRadius: '6px',
-                    background: cor || 'rgba(255,255,255,0.25)', color: 'white',
+                    padding: '7px 14px', border: `1px solid ${cor || 'rgba(255,255,255,0.26)'}`, borderRadius: '6px',
+                    background: cor || 'rgba(255,255,255,0.12)', color: 'white',
                     cursor: 'pointer', fontWeight: 'bold', fontSize: '13px',
                 });
-                btn.onclick = () => { notif.remove(); callback(); };
+                btn.onclick = () => { fecharNotificacao(); callback(); };
                 btnWrapper.appendChild(btn);
             });
 
             notif.appendChild(btnWrapper);
         } else {
-            // Fecha automaticamente em 6s se não tiver botões
-            setTimeout(() => { if (notif.parentNode) notif.remove(); }, 6000);
+            // Fecha automaticamente depois de 20s se nao tiver botoes.
+            setTimeout(fecharNotificacao, 20000);
         }
 
-        // Botão X para fechar manualmente
+        // Botao X para fechar manualmente
         const fechar = document.createElement('span');
-        fechar.textContent = '✕';
+        fechar.textContent = '×';
         Object.assign(fechar.style, {
-            position: 'absolute', top: '8px', right: '12px',
-            cursor: 'pointer', opacity: '0.7', fontSize: '12px',
+            position: 'absolute', top: '6px', right: '10px',
+            cursor: 'pointer', opacity: '0.6', fontSize: '18px', lineHeight: '1',
+            color: '#b6bdc4', fontWeight: '300',
         });
-        fechar.onclick = () => notif.remove();
-        notif.style.position = 'fixed';  // garante posicionamento do X
+        fechar.onclick = fecharNotificacao;
         notif.appendChild(fechar);
 
         document.body.appendChild(notif);
         return notif;
     }
-
 
     // ── Seletor de tasks quando há múltiplos atendimentos abertos ────────
     function mostrarSeletorEmpresas(empresas, empresaOriginal, botao, aoSelecionar, aoCancelar) {
@@ -3370,7 +5199,605 @@ SCRIPT_BOTAO = r"""
 
         document.body.appendChild(notif);
     }
-    function mostrarSeletorTasks(tasks, hora, empresa, botaoOut, codigoCliente) {
+    const relatosCheckoutEmConfirmacao = new Set();
+    const textosFluxoEmConfirmacao = new Set();
+
+    function mostrarPopupTextosFluxo(dados, botaoOut, aoConfirmar, aoCancelar) {
+        const existente = document.getElementById('auvo-notif');
+        if (existente) existente.remove();
+
+        const notif = document.createElement('div');
+        notif.id = 'auvo-notif';
+        Object.assign(notif.style, {
+            position: 'fixed', bottom: '24px', right: '24px', zIndex: '99999',
+            background: '#2c3e50', color: 'white',
+            borderRadius: '10px', padding: '16px 20px', width: 'min(620px, calc(100vw - 48px))',
+            boxShadow: '0 6px 24px rgba(0,0,0,0.3)', fontFamily: 'sans-serif',
+            fontSize: '14px', lineHeight: '1.5',
+        });
+
+        const titulo = document.createElement('div');
+        titulo.style.cssText = 'font-weight:bold; margin-bottom:8px; font-size:15px;';
+        titulo.textContent = 'Descricao e relato gerados. Confira ou edite antes de lancar no Auvo.';
+        notif.appendChild(titulo);
+
+        const criarLabel = (texto) => {
+            const label = document.createElement('label');
+            label.textContent = texto;
+            label.style.cssText = 'display:block; font-size:12px; opacity:.85; margin:10px 0 5px;';
+            return label;
+        };
+
+        const estiloCampo = {
+            width: '100%', resize: 'vertical',
+            border: '1px solid rgba(255,255,255,0.25)', borderRadius: '6px',
+            padding: '10px', boxSizing: 'border-box', fontFamily: 'sans-serif',
+            fontSize: '13px', lineHeight: '1.45', color: '#1f2d3d', background: '#fff',
+            outline: 'none',
+        };
+
+        notif.appendChild(criarLabel('Descricao da task'));
+        const textareaDescricao = document.createElement('textarea');
+        textareaDescricao.value = dados.descricao || '';
+        Object.assign(textareaDescricao.style, estiloCampo, { minHeight: '82px' });
+        notif.appendChild(textareaDescricao);
+
+        notif.appendChild(criarLabel('Relato do check-out'));
+        const textareaRelato = document.createElement('textarea');
+        textareaRelato.value = dados.relato || '';
+        Object.assign(textareaRelato.style, estiloCampo, { minHeight: '170px' });
+        notif.appendChild(textareaRelato);
+
+        const botoes = document.createElement('div');
+        botoes.style.cssText = 'display:flex; gap:8px; margin-top:10px; justify-content:flex-end;';
+
+        const cancelar = document.createElement('button');
+        cancelar.textContent = 'Cancelar';
+        Object.assign(cancelar.style, {
+            padding: '8px 12px', border: 'none', borderRadius: '6px',
+            background: 'rgba(255,255,255,0.15)', color: 'white',
+            cursor: 'pointer', fontWeight: 'bold',
+        });
+        cancelar.onclick = () => {
+            notif.remove();
+            textosFluxoEmConfirmacao.delete(dados.flow_key);
+            if (aoCancelar) aoCancelar();
+        };
+
+        const confirmar = document.createElement('button');
+        confirmar.textContent = 'Esta certo, lancar';
+        Object.assign(confirmar.style, {
+            padding: '8px 12px', border: 'none', borderRadius: '6px',
+            background: '#27ae60', color: 'white',
+            cursor: 'pointer', fontWeight: 'bold',
+        });
+        confirmar.onclick = () => {
+            const descricaoEditada = textareaDescricao.value.trim();
+            const relatoEditado = textareaRelato.value.trim();
+            if (!descricaoEditada) {
+                mostrarNotificacao('A descricao nao pode ficar vazia.', 'erro');
+                textareaDescricao.focus();
+                return;
+            }
+            if (!relatoEditado) {
+                mostrarNotificacao('O relato nao pode ficar vazio.', 'erro');
+                textareaRelato.focus();
+                return;
+            }
+            notif.remove();
+            aoConfirmar(descricaoEditada, relatoEditado);
+        };
+
+        botoes.appendChild(cancelar);
+        botoes.appendChild(confirmar);
+        notif.appendChild(botoes);
+        document.body.appendChild(notif);
+        textareaDescricao.focus();
+        textareaDescricao.setSelectionRange(textareaDescricao.value.length, textareaDescricao.value.length);
+    }
+
+    function confirmarTextosFluxo(dados, botaoOut, opcoes = {}) {
+        const flowKey = dados.flow_key;
+        if (!flowKey) return;
+        if (textosFluxoEmConfirmacao.has(flowKey)) return;
+        textosFluxoEmConfirmacao.add(flowKey);
+        setBotao(botaoOut, 'Conferir textos...', '#8e44ad', true, AUVO_ETAPAS_PROGRESSO['relato_ok']);
+        mostrarPopupTextosFluxo(
+            dados,
+            botaoOut,
+            (descricaoEditada, relatoEditado) => {
+                setBotao(botaoOut, 'Criando task...', '#2980b9', true, AUVO_ETAPAS_PROGRESSO['criando_task']);
+                fetch('http://localhost:8765/auvo-checkout-criar-confirmar-textos', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        flow_key: flowKey,
+                        descricao: descricaoEditada,
+                        relato: relatoEditado,
+                    }),
+                })
+                .then(r => r.json())
+                .then(resp => {
+                    textosFluxoEmConfirmacao.delete(flowKey);
+                    if (tratarRespostaCancelada(resp, botaoOut, () => resetBotaoCheckout(botaoOut), 'Processo cancelado.')) return;
+                    if (resp.status !== 'ok') throw new Error(resp.mensagem || 'Erro ao confirmar textos.');
+                    if (opcoes.aoConfirmado) opcoes.aoConfirmado(resp);
+                })
+                .catch(err => {
+                    textosFluxoEmConfirmacao.delete(flowKey);
+                    setBotao(botaoOut, 'Erro nos textos', '#e74c3c', false);
+                    mostrarNotificacao(`Erro ao confirmar textos: ${err.message}`, 'erro');
+                    resetBotaoCheckout(botaoOut);
+                    liberarAcoes();
+                });
+            },
+            () => {
+                fetch('http://localhost:8765/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chave: flowKey }),
+                }).finally(() => {
+                    resetBotaoCheckout(botaoOut);
+                    liberarAcoes();
+                });
+            }
+        );
+    }
+
+    function mostrarPopupRelatoCheckout(dados, botaoOut, aoConfirmar, aoCancelar) {
+        const existente = document.getElementById('auvo-notif');
+        if (existente) existente.remove();
+
+        const notif = document.createElement('div');
+        notif.id = 'auvo-notif';
+        Object.assign(notif.style, {
+            position: 'fixed', bottom: '24px', right: '24px', zIndex: '99999',
+            background: '#2c3e50', color: 'white',
+            borderRadius: '10px', padding: '16px 20px', width: 'min(560px, calc(100vw - 48px))',
+            boxShadow: '0 6px 24px rgba(0,0,0,0.3)', fontFamily: 'sans-serif',
+            fontSize: '14px', lineHeight: '1.5',
+        });
+
+        const titulo = document.createElement('div');
+        titulo.style.cssText = 'font-weight:bold; margin-bottom:8px; font-size:15px;';
+        titulo.textContent = `Relato gerado para check-out da Task #${dados.task_id}. Confira ou edite antes de lançar.`;
+        notif.appendChild(titulo);
+
+        const textarea = document.createElement('textarea');
+        textarea.value = dados.relato || '';
+        Object.assign(textarea.style, {
+            width: '100%', minHeight: '180px', resize: 'vertical',
+            border: '1px solid rgba(255,255,255,0.25)', borderRadius: '6px',
+            padding: '10px', boxSizing: 'border-box', fontFamily: 'sans-serif',
+            fontSize: '13px', lineHeight: '1.45', color: '#1f2d3d', background: '#fff',
+            outline: 'none',
+        });
+        notif.appendChild(textarea);
+
+        const botoes = document.createElement('div');
+        botoes.style.cssText = 'display:flex; gap:8px; margin-top:10px; justify-content:flex-end;';
+
+        const cancelar = document.createElement('button');
+        cancelar.textContent = 'Cancelar';
+        Object.assign(cancelar.style, {
+            padding: '8px 12px', border: 'none', borderRadius: '6px',
+            background: 'rgba(255,255,255,0.15)', color: 'white',
+            cursor: 'pointer', fontWeight: 'bold',
+        });
+        cancelar.onclick = () => {
+            notif.remove();
+            relatosCheckoutEmConfirmacao.delete(dados.status_key || `checkout_${dados.task_id}`);
+            if (aoCancelar) aoCancelar();
+        };
+
+        const confirmar = document.createElement('button');
+        confirmar.textContent = 'Está certo, lançar';
+        Object.assign(confirmar.style, {
+            padding: '8px 12px', border: 'none', borderRadius: '6px',
+            background: '#27ae60', color: 'white',
+            cursor: 'pointer', fontWeight: 'bold',
+        });
+        confirmar.onclick = () => {
+            const relatoEditado = textarea.value.trim();
+            if (!relatoEditado) {
+                mostrarNotificacao('O relato não pode ficar vazio.', 'erro');
+                textarea.focus();
+                return;
+            }
+            notif.remove();
+            relatosCheckoutEmConfirmacao.delete(dados.status_key || `checkout_${dados.task_id}`);
+            aoConfirmar(relatoEditado);
+        };
+
+        botoes.appendChild(cancelar);
+        botoes.appendChild(confirmar);
+        notif.appendChild(botoes);
+        document.body.appendChild(notif);
+        textarea.focus();
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    }
+
+    function mostrarSelecaoEquipamento(dados, botao, aoConfirmar, aoCancelar) {
+    const opcoes = dados.opcoes || [];
+
+    // Sem nenhum equipamento cadastrado pro cliente: pede pra digitar direto
+    if (opcoes.length === 0) {
+        const digitado = prompt('Cliente sem equipamento cadastrado no Auvo.\nDigite o nome do equipamento:');
+        if (digitado && digitado.trim()) {
+            setBotao(botao, 'Registrando equipamento...', '#f39c12', true);
+            if (aoConfirmar) aoConfirmar(digitado.trim());
+        } else {
+            if (aoCancelar) aoCancelar();
+            liberarAcoes();
+        }
+        return;
+    }
+
+    // Remove popup anterior
+    const anteriorPopup = document.getElementById('auvo-equip-popup');
+    if (anteriorPopup) anteriorPopup.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'auvo-equip-popup';
+    Object.assign(overlay.style, {
+        position: 'fixed', inset: '0', zIndex: '2147483647',
+        background: 'rgba(0,0,0,0.55)', display: 'flex',
+        alignItems: 'center', justifyContent: 'center',
+    });
+
+    const caixa = document.createElement('div');
+    Object.assign(caixa.style, {
+        background: '#ffffff', color: '#111111',
+        borderRadius: '10px', border: '1px solid #d0d0d0',
+        boxShadow: '0 8px 32px rgba(0,0,0,0.25)',
+        padding: '18px 20px 16px', fontFamily: 'Arial, sans-serif',
+        width: 'min(340px, calc(100vw - 32px))', boxSizing: 'border-box',
+    });
+
+    const titulo = document.createElement('div');
+    titulo.textContent = 'Qual equipamento foi atendido?';
+    Object.assign(titulo.style, {
+        fontWeight: '700', fontSize: '13px', color: '#111111',
+        marginBottom: '12px', lineHeight: '1.3',
+    });
+    caixa.appendChild(titulo);
+
+    const select = document.createElement('select');
+    Object.assign(select.style, {
+        width: '100%', padding: '7px 10px', borderRadius: '6px',
+        border: '1px solid #bbbbbb',
+        background: '#ffffff', color: '#111111',
+        fontSize: '12px', boxSizing: 'border-box', marginBottom: '12px',
+        cursor: 'pointer', outline: 'none',
+    });
+
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = '— selecione o equipamento —';
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    select.appendChild(placeholder);
+
+    opcoes.forEach(nome => {
+        const op = document.createElement('option');
+        op.value = nome;
+        op.textContent = nome;
+        select.appendChild(op);
+    });
+
+    const opOutro = document.createElement('option');
+    opOutro.value = '__outro__';
+    opOutro.textContent = '✏ Outro (digitar manualmente)';
+    select.appendChild(opOutro);
+
+    caixa.appendChild(select);
+
+    // Campo de texto pra digitar o nome do equipamento quando "Outro" for
+    // selecionado. Fica escondido por padrão e só aparece nesse caso —
+    // evita depender do prompt() nativo do navegador, que o Playwright
+    // costuma descartar automaticamente e nunca deixava o usuário digitar.
+    const inputOutro = document.createElement('input');
+    inputOutro.type = 'text';
+    inputOutro.placeholder = 'Digite o nome do equipamento...';
+    Object.assign(inputOutro.style, {
+        width: '100%', padding: '7px 10px', borderRadius: '6px',
+        border: '1px solid #bbbbbb',
+        background: '#ffffff', color: '#111111',
+        fontSize: '12px', boxSizing: 'border-box', marginBottom: '12px',
+        outline: 'none', display: 'none',
+    });
+    caixa.appendChild(inputOutro);
+
+    select.addEventListener('change', () => {
+        if (select.value === '__outro__') {
+            inputOutro.style.display = 'block';
+            inputOutro.focus();
+        } else {
+            inputOutro.style.display = 'none';
+            inputOutro.style.borderColor = '#bbbbbb';
+        }
+    });
+
+    const botoes = document.createElement('div');
+    Object.assign(botoes.style, { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
+
+    const btnCancelar = document.createElement('button');
+    btnCancelar.textContent = 'Cancelar';
+    Object.assign(btnCancelar.style, {
+        padding: '6px 14px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.2)',
+        background: 'rgba(255,255,255,0.1)', color: '#ccc',
+        cursor: 'pointer', fontSize: '12px', fontWeight: '600',
+    });
+    btnCancelar.onclick = () => { overlay.remove(); if (aoCancelar) aoCancelar(); liberarAcoes(); };
+
+    const btnConfirmar = document.createElement('button');
+    btnConfirmar.textContent = 'Confirmar';
+    Object.assign(btnConfirmar.style, {
+        padding: '6px 14px', borderRadius: '6px', border: '1px solid #27ae60',
+        background: '#27ae60', color: 'white',
+        cursor: 'pointer', fontSize: '12px', fontWeight: '700',
+    });
+    btnConfirmar.onclick = () => {
+        const val = select.value;
+        if (!val) { select.style.borderColor = '#e74c3c'; return; }
+        if (val === '__outro__') {
+            const digitado = inputOutro.value.trim();
+            if (!digitado) { inputOutro.style.borderColor = '#e74c3c'; inputOutro.focus(); return; }
+            overlay.remove();
+            setBotao(botao, 'Registrando equipamento...', '#f39c12', true);
+            if (aoConfirmar) aoConfirmar(digitado);
+        } else {
+            overlay.remove();
+            setBotao(botao, 'Registrando equipamento...', '#f39c12', true);
+            if (aoConfirmar) aoConfirmar(val);
+        }
+    };
+
+    botoes.appendChild(btnCancelar);
+    botoes.appendChild(btnConfirmar);
+    caixa.appendChild(botoes);
+    overlay.appendChild(caixa);
+    document.body.appendChild(overlay);
+}
+    
+    function mostrarConfirmacaoSegmento(dados, botao, aoContinuar, aoParar) {
+        const mensagem = dados.mensagem || 'Verifique o cadastro do cliente. Deseja continuar o check-in?';
+        mostrarNotificacao(
+            mensagem,
+            'aviso',
+            [
+                {
+                    label: 'Continuar check-in',
+                    cor: '#27ae60',
+                    callback: () => {
+                        setBotao(botao, 'Continuando...', '#f39c12', true);
+                        if (aoContinuar) aoContinuar();
+                    },
+                },
+                {
+                    label: 'Parar',
+                    cor: 'rgba(255,255,255,0.16)',
+                    callback: () => {
+                        if (aoParar) aoParar();
+                        liberarAcoes();
+                    },
+                },
+            ]
+        );
+    }
+
+    function confirmarRelatoCheckout(dados, botaoOut, opcoes = {}) {
+        const statusKey = dados.status_key || `checkout_${dados.task_id}`;
+        if (!dados || !dados.task_id) return;
+        if (relatosCheckoutEmConfirmacao.has(statusKey)) return;
+        relatosCheckoutEmConfirmacao.add(statusKey);
+        setBotao(botaoOut, `Conferir relato Task #${dados.task_id}`, '#8e44ad', true, AUVO_ETAPAS_PROGRESSO['relato_ok']);
+        const enviarConfirmacaoRelato = (relatoFinal) => {
+            setBotao(botaoOut, `Lançando Check-Out...`, '#2980b9', true, AUVO_ETAPAS_PROGRESSO['checkout']);
+            fetch('http://localhost:8765/auvo-checkout-confirmar', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    task_id: dados.task_id,
+                    status_key: statusKey,
+                    flow_key: dados.flow_key || null,
+                    relato: relatoFinal,
+                    data: dados.data || null,
+                    hora: dados.hora || null,
+                    cancel_key: dados.cancel_key || null,
+                }),
+            })
+            .then(r => r.json())
+            .then(resp => {
+                if (tratarRespostaCancelada(resp, botaoOut, () => resetBotaoCheckout(botaoOut), 'Check-out cancelado.')) return;
+                if (resp.status !== 'ok') throw new Error(resp.mensagem || 'Erro ao confirmar relato.');
+                if (opcoes.aoConfirmado) opcoes.aoConfirmado(resp);
+            })
+            .catch(err => {
+                setBotao(botaoOut, 'Erro no relato', '#e74c3c', false);
+                mostrarNotificacao(`Erro ao confirmar relato: ${err.message}`, 'erro');
+                resetBotaoCheckout(botaoOut);
+                liberarAcoes();
+            });
+        };
+
+        mostrarPopupRelatoCheckout(
+            { ...dados, status_key: statusKey },
+            botaoOut,
+            (relatoEditado) => {
+                const verificacaoEquipamento = dados.verificacao_equipamento || {};
+                if (verificacaoEquipamento.status === 'selecionar') {
+                    mostrarSelecaoEquipamento(
+                        { ...verificacaoEquipamento, status_key: statusKey },
+                        botaoOut,
+                        (equipamentoEscolhido) => {
+                            fetch('http://localhost:8765/auvo-checkout-selecionar-equipamento', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    codigo_cliente: dados.codigo_cliente || null,
+                                    status_key: statusKey,
+                                    task_id: dados.task_id,
+                                    empresa: dados.empresa || '',
+                                    equipamento: equipamentoEscolhido,
+                                    relato: relatoEditado,
+                                }),
+                            })
+                            .then(r => r.json())
+                            .then(resp => {
+                                if (resp.status !== 'ok') throw new Error(resp.mensagem || 'Erro ao selecionar equipamento.');
+                                dados.verificacao_equipamento = {
+                                    status: resp.vinculado ? 'vinculado' : 'nao_vinculado',
+                                    equipamento: resp.equipamento,
+                                };
+                                enviarConfirmacaoRelato(resp.relato || relatoEditado);
+                            })
+                            .catch(err => {
+                                setBotao(botaoOut, 'Erro no equipamento', '#e74c3c', false);
+                                mostrarNotificacao(`Erro ao selecionar equipamento: ${err.message}`, 'erro');
+                                resetBotaoCheckout(botaoOut);
+                                liberarAcoes();
+                            });
+                        },
+                        () => {
+                            fetch('http://localhost:8765/cancel', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ chave: dados.flow_key || statusKey }),
+                            }).catch(() => {});
+                            resetBotaoCheckout(botaoOut);
+                            liberarAcoes();
+                        }
+                    );
+                    return;
+                }
+                enviarConfirmacaoRelato(relatoEditado);
+                return;
+            },
+            () => {
+                fetch('http://localhost:8765/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chave: dados.flow_key || statusKey }),
+                }).catch(() => {});
+                resetBotaoCheckout(botaoOut);
+                liberarAcoes();
+            }
+        );
+    }
+
+    function iniciarPollingCheckoutConfirmado(dados, botaoOut) {
+        const chaveCheckout = dados.status_key || `checkout_${dados.task_id}`;
+        const limparCancelarCheckout = mostrarCancelamentoProcesso(botaoOut, chaveCheckout, `Check-out Task #${dados.task_id}`, () => resetBotaoCheckout(botaoOut));
+        iniciarPolling(chaveCheckout, 1000, (s) => {
+            if (tratarCancelado(s, botaoOut, limparCancelarCheckout, () => resetBotaoCheckout(botaoOut), 'Check-out cancelado.')) return true;
+            if (s.status === 'auvo_instavel') {
+                limparCancelarCheckout();
+                setBotao(botaoOut, 'Auvo com Instabilidade', '#c0392b', false);
+                mostrarNotificacao('O Auvo ficou instável durante o check-out. Verifique e tente novamente.', 'erro');
+                resetBotaoCheckout(botaoOut);
+                return true;
+            }
+            if (s.status === 'relato_ok') {
+                setBotao(botaoOut, 'Lançando Check-Out...', '#2980b9', true, AUVO_ETAPAS_PROGRESSO['relato_ok']);
+            }
+            if (s.status === 'done') {
+                limparCancelarCheckout();
+                setBotao(botaoOut, `Check-Out salvo ${dados.hora || s.hora || ''}`, '#27ae60', true);
+                mostrarNotificacao(`Check-out concluído com sucesso${dados.hora ? ` às ${dados.hora}` : ''}.`, 'sucesso');
+                resetBotaoCheckout(botaoOut);
+                return true;
+            }
+            return false;
+        });
+    }
+
+    function textoDataHoraTask(t) {
+        const data = t.data_formatada || t.data || '';
+        const hora = t.hora ? t.hora.substring(0, 5) : '';
+        if (data && hora) return `${data} ${hora}`;
+        return data || hora || 'data/hora não informada';
+    }
+
+    function dataHojeISO() {
+        const agora = new Date();
+        return `${agora.getFullYear()}-${String(agora.getMonth() + 1).padStart(2, '0')}-${String(agora.getDate()).padStart(2, '0')}`;
+    }
+
+    function taskEhHoje(task) {
+        return !!task && String(task.data || '').slice(0, 10) === dataHojeISO();
+    }
+
+    function mostrarConfirmacaoTaskCheckout(task, empresa, botaoOut, aoUsarTask, aoCriarFluxo, aoCancelar) {
+        const existente = document.getElementById('auvo-notif');
+        if (existente) existente.remove();
+
+        const notif = document.createElement('div');
+        notif.id = 'auvo-notif';
+        Object.assign(notif.style, {
+            position: 'fixed', bottom: '24px', right: '24px', zIndex: '99999',
+            background: '#2c3e50', color: 'white',
+            borderRadius: '10px', padding: '16px 20px', maxWidth: '470px',
+            boxShadow: '0 6px 24px rgba(0,0,0,0.3)', fontFamily: 'sans-serif',
+            fontSize: '14px', lineHeight: '1.5',
+        });
+
+        const titulo = document.createElement('div');
+        titulo.style.cssText = 'font-weight:bold; margin-bottom:10px; font-size:15px;';
+        titulo.textContent = 'Atendimento aberto encontrado';
+        notif.appendChild(titulo);
+
+        const detalhes = document.createElement('div');
+        detalhes.style.cssText = 'margin-bottom:12px;';
+        detalhes.textContent = `${empresa} - Task #${task.taskID} - ${textoDataHoraTask(task)}`;
+        notif.appendChild(detalhes);
+
+        const usar = document.createElement('button');
+        usar.textContent = 'Lançar nessa task';
+        Object.assign(usar.style, {
+            display: 'block', width: '100%', margin: '6px 0',
+            padding: '9px 12px', border: 'none', borderRadius: '6px',
+            background: '#27ae60', color: 'white', cursor: 'pointer',
+            fontWeight: 'bold', textAlign: 'left',
+        });
+        usar.onclick = () => {
+            notif.remove();
+            aoUsarTask();
+        };
+        notif.appendChild(usar);
+
+        const fluxo = document.createElement('button');
+        fluxo.textContent = 'Criar fluxo check-in + check-out';
+        Object.assign(fluxo.style, {
+            display: 'block', width: '100%', margin: '6px 0',
+            padding: '9px 12px', border: 'none', borderRadius: '6px',
+            background: '#2980b9', color: 'white', cursor: 'pointer',
+            fontWeight: 'bold', textAlign: 'left',
+        });
+        fluxo.onclick = () => {
+            notif.remove();
+            aoCriarFluxo();
+        };
+        notif.appendChild(fluxo);
+
+        const cancelar = document.createElement('button');
+        cancelar.textContent = 'Cancelar';
+        Object.assign(cancelar.style, {
+            display: 'block', width: '100%', margin: '8px 0 0',
+            padding: '7px', border: 'none', borderRadius: '6px',
+            background: 'rgba(255,255,255,0.15)', color: 'white',
+            cursor: 'pointer', fontSize: '13px',
+        });
+        cancelar.onclick = () => {
+            notif.remove();
+            if (aoCancelar) aoCancelar();
+        };
+        notif.appendChild(cancelar);
+
+        document.body.appendChild(notif);
+    }
+
+    function mostrarSeletorTasks(tasks, hora, empresa, botaoOut, codigoCliente, sistemaCliente) {
         const existente = document.getElementById('auvo-notif');
         if (existente) existente.remove();
 
@@ -3386,14 +5813,14 @@ SCRIPT_BOTAO = r"""
 
         const titulo = document.createElement('div');
         titulo.style.cssText = 'font-weight:bold; margin-bottom:10px; font-size:15px;';
-        titulo.textContent = `⚠️ Encontrei ${tasks.length} atendimentos abertos para ${empresa}. Qual devo finalizar?`;
+        titulo.textContent = `Encontrei ${tasks.length} atendimentos abertos nos últimos 10 dias para ${empresa}. Qual devo finalizar?`;
         notif.appendChild(titulo);
 
         tasks.forEach((t, idx) => {
             const btn = document.createElement('button');
-            const hora_exibida = t.hora ? t.hora.substring(0, 5) : '??:??';
+            const dataHora = textoDataHoraTask(t);
             const desc = t.descricao ? t.descricao.substring(0, 60) : '';
-            btn.textContent = `#${t.taskID} — ${hora_exibida}h  ${desc}`;
+            btn.textContent = `#${t.taskID} - ${dataHora} - ${desc}`;
             Object.assign(btn.style, {
                 display: 'block', width: '100%', margin: '4px 0',
                 padding: '8px 12px', border: 'none', borderRadius: '6px',
@@ -3403,64 +5830,95 @@ SCRIPT_BOTAO = r"""
             });
             btn.onclick = () => {
                 notif.remove();
-                // Dispara checkout com a task escolhida
-                setBotao(botaoOut, `📤 Checkout Task #${t.taskID}...`, '#e67e22', true);
-                fetch('http://localhost:8765/auvo-checkout', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        empresa:          empresa,
-                        task_id_escolhido: t.taskID,
-                        codigo_cliente:   codigoCliente,
-                    }),
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.status === 'auvo_instavel') {
-                        setBotao(botaoOut, '⚠️ Auvo com Instabilidade', '#c0392b', false);
-                        mostrarNotificacao('O Auvo ficou instável durante o check-out.', 'erro');
-                        resetBotaoCheckout(botaoOut);
-                        return;
-                    }
-                    if (data.status !== 'ok') throw new Error(data.mensagem || 'Erro desconhecido');
-
-                    iniciarPolling(`checkout_${data.task_id}`, 1000, (s) => {
-                        if (s.status === 'auvo_instavel') {
+                const usarTaskSelecionada = () => {
+                    const cancelKeyCheckoutSelecionadoInicial = criarChaveCancelamento('checkout');
+                    mostrarCancelamentoProcesso(botaoOut, cancelKeyCheckoutSelecionadoInicial, `Check-out Task #${t.taskID}`, () => resetBotaoCheckout(botaoOut));
+                    setBotao(botaoOut, `Checkout Task #${t.taskID}...`, '#e67e22', true);
+                    fetch('http://localhost:8765/auvo-checkout', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            empresa:          empresa,
+                            task_id_escolhido: t.taskID,
+                            codigo_cliente:   codigoCliente,
+                            sistema:          sistemaCliente || null,
+                            cancel_key:       cancelKeyCheckoutSelecionadoInicial,
+                            confirmar_task_checkout: true,
+                        }),
+                    })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (tratarRespostaCancelada(data, botaoOut, () => resetBotaoCheckout(botaoOut), 'Check-out cancelado.')) return;
+                        if (data.status === 'auvo_instavel') {
                             setBotao(botaoOut, '⚠️ Auvo com Instabilidade', '#c0392b', false);
-                            mostrarNotificacao('Auvo instável durante check-out. Tente novamente.', 'erro');
+                            mostrarNotificacao('O Auvo ficou instável durante o check-out.', 'erro');
                             resetBotaoCheckout(botaoOut);
-                            return true;
+                            return;
                         }
-                        if (s.status === 'relato_ok') {
-                            setBotao(botaoOut, '📋 Lançando Check-Out...', '#2980b9', true);
+                        if (data.status === 'confirmar_relato') {
+                            confirmarRelatoCheckout(
+                                { ...data, cancel_key: cancelKeyCheckoutSelecionadoInicial },
+                                botaoOut,
+                                { aoConfirmado: () => iniciarPollingCheckoutConfirmado(data, botaoOut) }
+                            );
+                            return;
                         }
-                        if (s.status === 'done') {
-                            setBotao(botaoOut, `✓ Check-Out ${data.hora}`, '#27ae60', true);
-                            mostrarNotificacao(`✅ Check-out da Task #${data.task_id} salvo com sucesso!`, 'sucesso');
-                            resetBotaoCheckout(botaoOut);
-                            return true;
-                        }
-                        return false;
+                        if (data.status !== 'ok') throw new Error(data.mensagem || 'Erro desconhecido');
+
+                        iniciarPollingCheckoutConfirmado(data, botaoOut);
+                    })
+                    .catch(err => {
+                        setBotao(botaoOut, '❌ Erro!', '#e74c3c', false);
+                        mostrarNotificacao(`Erro: ${err.message}`, 'erro');
+                        resetBotaoCheckout(botaoOut);
                     });
-                })
-                .catch(err => {
-                    setBotao(botaoOut, '❌ Erro!', '#e74c3c', false);
-                    mostrarNotificacao(`Erro: ${err.message}`, 'erro');
-                    resetBotaoCheckout(botaoOut);
-                });
+                };
+
+                if (taskEhHoje(t)) {
+                    usarTaskSelecionada();
+                    return;
+                }
+
+                setBotao(botaoOut, 'Confirmar task', '#8e44ad', false);
+                mostrarConfirmacaoTaskCheckout(
+                    t,
+                    empresa,
+                    botaoOut,
+                    usarTaskSelecionada,
+                    () => iniciarFluxoCompleto(botaoOut, empresa, codigoCliente, null, sistemaCliente),
+                    () => {
+                        resetBotaoCheckout(botaoOut);
+                        liberarAcoes();
+                    }
+                );
             };
             notif.appendChild(btn);
         });
 
+        const criarFluxo = document.createElement('button');
+        criarFluxo.textContent = 'Criar fluxo check-in + check-out';
+        Object.assign(criarFluxo.style, {
+            display: 'block', width: '100%', margin: '8px 0 0',
+            padding: '8px 12px', border: 'none', borderRadius: '6px',
+            background: '#2980b9', color: 'white',
+            cursor: 'pointer', fontSize: '13px', fontWeight: 'bold',
+            textAlign: 'left',
+        });
+        criarFluxo.onclick = () => {
+            notif.remove();
+            iniciarFluxoCompleto(botaoOut, empresa, codigoCliente, null, sistemaCliente);
+        };
+        notif.appendChild(criarFluxo);
+
         const cancelar = document.createElement('button');
-        cancelar.textContent = '✕ Cancelar';
+        cancelar.textContent = 'Cancelar';
         Object.assign(cancelar.style, {
             display: 'block', width: '100%', margin: '8px 0 0',
             padding: '6px', border: 'none', borderRadius: '6px',
             background: 'rgba(255,255,255,0.15)', color: 'white',
             cursor: 'pointer', fontSize: '13px',
         });
-        cancelar.onclick = () => { notif.remove(); resetBotaoCheckout(botaoOut); };
+        cancelar.onclick = () => { notif.remove(); resetBotaoCheckout(botaoOut); liberarAcoes(); };
         notif.appendChild(cancelar);
 
         document.body.appendChild(notif);
@@ -3526,6 +5984,24 @@ SCRIPT_BOTAO = r"""
                 background: rgba(16,20,25,0.92);
                 color: white;
                 font: 700 9px/1 Arial, sans-serif;
+                position: relative;
+            }
+            #botao-auvo.auvo-cancelavel, #botao-auvo-checkout.auvo-cancelavel, #botao-auvo-pausa.auvo-cancelavel, #botao-auvo-despausa.auvo-cancelavel {
+                cursor: pointer !important;
+                opacity: 1 !important;
+            }
+            #botao-auvo.auvo-cancelavel:hover .auvo-progress-inner, #botao-auvo-checkout.auvo-cancelavel:hover .auvo-progress-inner, #botao-auvo-pausa.auvo-cancelavel:hover .auvo-progress-inner, #botao-auvo-despausa.auvo-cancelavel:hover .auvo-progress-inner {
+                color: transparent;
+            }
+            #botao-auvo.auvo-cancelavel:hover .auvo-progress-inner::after, #botao-auvo-checkout.auvo-cancelavel:hover .auvo-progress-inner::after, #botao-auvo-pausa.auvo-cancelavel:hover .auvo-progress-inner::after, #botao-auvo-despausa.auvo-cancelavel:hover .auvo-progress-inner::after {
+                content: '×';
+                color: #b8c0c8;
+                font: 700 18px/1 Arial, sans-serif;
+                position: absolute;
+                inset: 0;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
             }
         `;
         document.head.appendChild(style);
@@ -3551,13 +6027,14 @@ SCRIPT_BOTAO = r"""
         botao.style.backgroundColor = 'rgba(18,22,28,0.72)';
         botao.style.color = cor;
         botao.style.borderColor = cor;
-        botao.disabled = disabled;
-        botao.style.cursor = disabled ? 'not-allowed' : 'pointer';
-        botao.style.opacity = disabled ? '0.78' : '1';
+        const cancelavel = !!botao.dataset.auvoCancelKey;
+        botao.disabled = disabled && !cancelavel;
+        botao.style.cursor = disabled && !cancelavel ? 'not-allowed' : 'pointer';
+        botao.style.opacity = disabled && !cancelavel ? '0.78' : '1';
         botao.style.boxShadow = disabled ? 'none' : `0 0 0 1px ${cor}22, 0 4px 12px rgba(0,0,0,0.18)`;
         botao.style.transform = 'translateY(0)';
-        botao.title = label;
-        botao.setAttribute('aria-label', label);
+        botao.title = cancelavel ? `${botao.dataset.auvoCancelLabel || label} - clique para cancelar` : label;
+        botao.setAttribute('aria-label', botao.title);
     }
 
     // Percentuais fixos por etapa de cada fluxo
@@ -3603,12 +6080,15 @@ SCRIPT_BOTAO = r"""
         botao.style.backgroundColor = 'rgba(18,22,28,0.72)';
         botao.style.color = cor;
         botao.style.borderColor = cor;
-        botao.disabled = true;
-        botao.blur();
-        botao.style.cursor = 'not-allowed';
+        const cancelavel = !!botao.dataset.auvoCancelKey;
+        botao.disabled = !cancelavel;
+        if (!cancelavel) botao.blur();
+        botao.style.cursor = cancelavel ? 'pointer' : 'not-allowed';
         botao.style.opacity = '1';
         botao.style.boxShadow = 'none';
         botao.dataset.auvoProgress = String(percentual);
+        botao.title = cancelavel ? `${botao.dataset.auvoCancelLabel || label} - clique para cancelar` : label;
+        botao.setAttribute('aria-label', botao.title);
         atualizarProgressoCircular(botao, percentual, cor, label);
     }
 
@@ -3643,6 +6123,11 @@ SCRIPT_BOTAO = r"""
 
         if (!disabled) {
             delete botao.dataset.auvoProgress;
+            delete botao.dataset.auvoCancelKey;
+            delete botao.dataset.auvoCancelLabel;
+            delete botao.dataset.auvoCanceling;
+            botao.auvoCancelReset = null;
+            botao.classList.remove('auvo-cancelavel');
         }
 
         if (lower.includes('erro')) {
@@ -3748,18 +6233,89 @@ SCRIPT_BOTAO = r"""
         return intervalo;
     }
 
+    function solicitarCancelamentoProcesso(chave) {
+        return fetch('http://localhost:8765/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chave }),
+        }).then(r => r.json());
+    }
+
+    function criarChaveCancelamento(tipo) {
+        return `${tipo}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    function mostrarCancelamentoProcesso(botao, chave, label, aoCancelar) {
+        if (!botao || !chave) return () => {};
+        botao.dataset.auvoCancelKey = chave;
+        botao.dataset.auvoCancelLabel = label || 'Processo em andamento';
+        botao.dataset.auvoCanceling = '0';
+        botao.auvoCancelReset = aoCancelar || null;
+        botao.classList.add('auvo-cancelavel');
+        botao.disabled = false;
+        botao.style.cursor = 'pointer';
+        botao.title = `${botao.dataset.auvoCancelLabel} - clique para cancelar`;
+        botao.setAttribute('aria-label', botao.title);
+        return () => {
+            if (botao.dataset.auvoCancelKey === chave) {
+                delete botao.dataset.auvoCancelKey;
+                delete botao.dataset.auvoCancelLabel;
+                delete botao.dataset.auvoCanceling;
+                botao.auvoCancelReset = null;
+                botao.classList.remove('auvo-cancelavel');
+            }
+        };
+    }
+
+    async function processarCancelamentoBotao(botao) {
+        const chave = botao && botao.dataset.auvoCancelKey;
+        if (!chave) return false;
+        if (botao.dataset.auvoCanceling === '1') return true;
+        botao.dataset.auvoCanceling = '1';
+        const progresso = Number(botao.dataset.auvoProgress || 0) || undefined;
+        setBotao(botao, 'Cancelando...', '#7f8c8d', true, progresso);
+        try {
+            const data = await solicitarCancelamentoProcesso(chave);
+            if (data.status !== 'ok') throw new Error(data.mensagem || 'Falha ao cancelar');
+            mostrarNotificacao('Cancelamento solicitado. O processo será interrompido na próxima etapa segura.', 'aviso');
+        } catch (e) {
+            botao.dataset.auvoCanceling = '0';
+            mostrarNotificacao(`Erro ao cancelar: ${e.message}`, 'erro');
+        }
+        return true;
+    }
+    function tratarCancelado(s, botao, limparCancelar, resetar, mensagem) {
+        if (s.status !== 'cancelado') return false;
+        if (limparCancelar) limparCancelar();
+        setBotao(botao, 'Processo cancelado', '#7f8c8d', false);
+        mostrarNotificacao(mensagem || 'Processo cancelado.', 'aviso');
+        resetar();
+        return true;
+    }
+
+    function tratarRespostaCancelada(data, botao, resetar, mensagem) {
+        if (!data || data.status !== 'cancelado') return false;
+        setBotao(botao, 'Processo cancelado', '#7f8c8d', false);
+        mostrarNotificacao(mensagem || data.mensagem || 'Processo cancelado.', 'aviso');
+        resetar();
+        return true;
+    }
+
     // ── Fluxo de checkout simples ─────────────────────────────────────────
-    function iniciarFluxoCheckout(botaoOut, textoEmpresa, codigoCliente) {
+    function iniciarFluxoCheckout(botaoOut, textoEmpresa, codigoCliente, sistemaCliente) {
         bloquearAcaoOposta('checkout');
+        const cancelKeyCheckoutInicial = criarChaveCancelamento('checkout');
+        mostrarCancelamentoProcesso(botaoOut, cancelKeyCheckoutInicial, 'Check-out', () => resetBotaoCheckout(botaoOut));
         setBotao(botaoOut, 'Gerando relato...', '#8e44ad', true, AUVO_ETAPAS_PROGRESSO['gerando_relato']);
 
         fetch('http://localhost:8765/auvo-checkout', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ empresa: textoEmpresa, codigo_cliente: codigoCliente || null }),
+            body: JSON.stringify({ empresa: textoEmpresa, codigo_cliente: codigoCliente || null, sistema: sistemaCliente || null, cancel_key: cancelKeyCheckoutInicial }),
         })
         .then(r => r.json())
         .then(data => {
+            if (tratarRespostaCancelada(data, botaoOut, () => resetBotaoCheckout(botaoOut), 'Check-out cancelado.')) return;
             // ── Sem atendimento aberto ────────────────────────────────────
             if (data.status === 'multiplas_empresas') {
                 setBotao(botaoOut, 'Check-Out', '#e67e22', false);
@@ -3767,21 +6323,80 @@ SCRIPT_BOTAO = r"""
                     data.empresas,
                     textoEmpresa,
                     botaoOut,
-                    (empresaEscolhida) => iniciarFluxoCheckout(botaoOut, textoEmpresa, empresaEscolhida.codigo),
+                    (empresaEscolhida) => iniciarFluxoCheckout(botaoOut, textoEmpresa, empresaEscolhida.codigo, sistemaCliente),
                     () => resetBotaoCheckout(botaoOut)
                 );
                 return;
             }
+            if (data.status === 'confirmar_task_checkout') {
+                const taskConfirmacao = data.task || { taskID: data.task_id, data: data.data, hora: data.hora };
+                const usarTaskConfirmada = () => {
+                    const cancelKeyConfirmado = criarChaveCancelamento('checkout');
+                    mostrarCancelamentoProcesso(botaoOut, cancelKeyConfirmado, `Check-out Task #${data.task_id}`, () => resetBotaoCheckout(botaoOut));
+                    setBotao(botaoOut, `Checkout Task #${data.task_id}...`, '#e67e22', true);
+                    fetch('http://localhost:8765/auvo-checkout', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            empresa: textoEmpresa,
+                            task_id_escolhido: data.task_id,
+                            codigo_cliente: data.codigo_cliente,
+                            sistema: sistemaCliente || null,
+                            cancel_key: cancelKeyConfirmado,
+                            confirmar_task_checkout: true,
+                        }),
+                    })
+                    .then(r => r.json())
+                    .then(resp => {
+                        if (tratarRespostaCancelada(resp, botaoOut, () => resetBotaoCheckout(botaoOut), 'Check-out cancelado.')) return;
+                        if (resp.status === 'confirmar_relato') {
+                            confirmarRelatoCheckout(
+                                { ...resp, cancel_key: cancelKeyConfirmado },
+                                botaoOut,
+                                { aoConfirmado: () => iniciarPollingCheckoutConfirmado(resp, botaoOut) }
+                            );
+                            return;
+                        }
+                        if (resp.status !== 'ok') throw new Error(resp.mensagem || 'Erro desconhecido');
+                        iniciarPollingCheckoutConfirmado(resp, botaoOut);
+                    })
+                    .catch(err => {
+                        setBotao(botaoOut, 'Erro', '#e74c3c', false);
+                        mostrarNotificacao(`Erro no checkout: ${err.message}`, 'erro');
+                        resetBotaoCheckout(botaoOut);
+                    });
+                };
+
+                if (taskEhHoje(taskConfirmacao)) {
+                    usarTaskConfirmada();
+                    return;
+                }
+
+                setBotao(botaoOut, 'Confirmar task', '#8e44ad', false);
+                mostrarConfirmacaoTaskCheckout(
+                    taskConfirmacao,
+                    data.empresa || textoEmpresa,
+                    botaoOut,
+                    usarTaskConfirmada,
+                    () => iniciarFluxoCompleto(botaoOut, textoEmpresa, data.codigo_cliente, null, sistemaCliente),
+                    () => {
+                        resetBotaoCheckout(botaoOut);
+                        liberarAcoes();
+                    }
+                );
+                return;
+            }
+
             if (data.status === 'sem_atendimento') {
                 setBotao(botaoOut, 'Check-Out', '#e67e22', false);
                 mostrarNotificacao(
-                    '⚠️ Não foi encontrado um atendimento aberto para esta empresa hoje.\nDeseja criar o Check-in e já fazer o Check-out?',
+                    'Não foi encontrado um atendimento aberto nos últimos 10 dias para esta empresa.\nDeseja criar o Check-in e já fazer o Check-out?',
                     'aviso',
                     [
                         {
                             label: '✅ Criar e finalizar',
                             cor: '#27ae60',
-                            callback: () => iniciarFluxoCompleto(botaoOut, textoEmpresa, data.codigo_cliente),
+                            callback: () => iniciarFluxoCompleto(botaoOut, textoEmpresa, data.codigo_cliente, null, sistemaCliente),
                         },
                         {
                             label: '❌ Cancelar',
@@ -3806,7 +6421,7 @@ SCRIPT_BOTAO = r"""
             // ── Múltiplos atendimentos abertos: pede escolha ─────────────
             if (data.status === 'multiplas_tasks') {
                 setBotao(botaoOut, 'Check-Out', '#e67e22', false);
-                mostrarSeletorTasks(data.tasks, data.hora, textoEmpresa, botaoOut, data.codigo_cliente);
+                mostrarSeletorTasks(data.tasks, data.hora, textoEmpresa, botaoOut, data.codigo_cliente, sistemaCliente);
                 return;
             }
 
@@ -3818,29 +6433,21 @@ SCRIPT_BOTAO = r"""
                 return;
             }
 
+            // ── Confirmação do relato antes do checkout ───────────────────
+            if (data.status === 'confirmar_relato') {
+                confirmarRelatoCheckout(
+                    { ...data, cancel_key: cancelKeyCheckoutInicial },
+                    botaoOut,
+                    { aoConfirmado: () => iniciarPollingCheckoutConfirmado(data, botaoOut) }
+                );
+                return;
+            }
+
             if (data.status !== 'ok') {
                 throw new Error(data.mensagem || 'Erro desconhecido');
             }
 
-            // ── Polling do checkout ───────────────────────────────────────
-            iniciarPolling(`checkout_${data.task_id}`, 1000, (s) => {
-                if (s.status === 'auvo_instavel') {
-                    setBotao(botaoOut, '⚠️ Auvo com Instabilidade', '#c0392b', false);
-                    mostrarNotificacao('O Auvo ficou instável durante o check-out. Verifique e tente novamente.', 'erro');
-                    resetBotaoCheckout(botaoOut);
-                    return true; // para polling
-                }
-                if (s.status === 'relato_ok') {
-                    setBotao(botaoOut, 'Lançando Check-Out...', '#2980b9', true, AUVO_ETAPAS_PROGRESSO['relato_ok']);
-                }
-                if (s.status === 'done') {
-                    setBotao(botaoOut, `Check-Out salvo ${data.hora}`, '#27ae60', true);
-                    mostrarNotificacao(`Check-out concluído com sucesso às ${data.hora}.`, 'sucesso');
-                    resetBotaoCheckout(botaoOut);
-                    return true;
-                }
-                return false;
-            });
+            iniciarPollingCheckoutConfirmado(data, botaoOut);
         })
         .catch(err => {
             setBotao(botaoOut, '❌ Erro!', '#e74c3c', false);
@@ -3850,24 +6457,27 @@ SCRIPT_BOTAO = r"""
     }
 
     // ── Fluxo completo (sem checkin → cria checkin + checkout) ───────────
-    function iniciarFluxoCompleto(botaoOut, textoEmpresa, codigoCliente, inicioEscolhido) {
+    function iniciarFluxoCompleto(botaoOut, textoEmpresa, codigoCliente, inicioEscolhido, sistemaCliente, opcoes = {}) {
         bloquearAcaoOposta('checkout');
+        const cancelKeyFluxoInicial = criarChaveCancelamento('fluxo');
+        mostrarCancelamentoProcesso(botaoOut, cancelKeyFluxoInicial, 'Criando e finalizando atendimento', () => resetBotaoCheckout(botaoOut));
         setBotao(botaoOut, 'Criando atendimento...', '#8e44ad', true, AUVO_ETAPAS_PROGRESSO['iniciando']);
 
         fetch('http://localhost:8765/auvo-checkout-criar', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ empresa: textoEmpresa, codigo_cliente: codigoCliente, inicio_escolhido: inicioEscolhido || null }),
+            body: JSON.stringify({ empresa: textoEmpresa, codigo_cliente: codigoCliente, inicio_escolhido: inicioEscolhido || null, sistema: sistemaCliente || null, continuar_sem_contrato: !!opcoes.continuarSemContrato, continuar_sem_segmento: !!opcoes.continuarSemSegmento, cancel_key: cancelKeyFluxoInicial }),
         })
         .then(r => r.json())
         .then(data => {
+            if (tratarRespostaCancelada(data, botaoOut, () => resetBotaoCheckout(botaoOut), 'Processo cancelado.')) return;
             if (data.status === 'multiplas_empresas') {
                 setBotao(botaoOut, 'Check-Out', '#e67e22', false);
                 mostrarSeletorEmpresas(
                     data.empresas,
                     textoEmpresa,
                     botaoOut,
-                    (empresaEscolhida) => iniciarFluxoCompleto(botaoOut, textoEmpresa, empresaEscolhida.codigo),
+                    (empresaEscolhida) => iniciarFluxoCompleto(botaoOut, textoEmpresa, empresaEscolhida.codigo, null, sistemaCliente),
                     () => resetBotaoCheckout(botaoOut)
                 );
                 return;
@@ -3877,9 +6487,15 @@ SCRIPT_BOTAO = r"""
                 mostrarSeletorInicios(
                     data.inicios,
                     botaoOut,
-                    (inicioEscolhido) => iniciarFluxoCompleto(botaoOut, textoEmpresa, data.codigo_cliente || codigoCliente, inicioEscolhido),
+                    (inicioEscolhido) => iniciarFluxoCompleto(botaoOut, textoEmpresa, data.codigo_cliente || codigoCliente, inicioEscolhido, sistemaCliente),
                     () => resetBotaoCheckout(botaoOut)
                 );
+                return;
+            }
+            if (data.status === 'cliente_sem_segmento' || data.status === 'cliente_sem_contrato') {
+                const opcaoContinuar = data.status === 'cliente_sem_segmento' ? { continuarSemSegmento: true } : { continuarSemContrato: true };
+                setBotao(botaoOut, data.status === 'cliente_sem_segmento' ? 'Cliente sem segmento' : 'Cliente sem contrato', '#f39c12', false);
+                mostrarConfirmacaoSegmento(data, botaoOut, () => iniciarFluxoCompleto(botaoOut, textoEmpresa, data.codigo_cliente || codigoCliente, inicioEscolhido, sistemaCliente, opcaoContinuar), () => resetBotaoCheckout(botaoOut));
                 return;
             }
             if (data.status === 'auvo_instavel') {
@@ -3902,18 +6518,50 @@ SCRIPT_BOTAO = r"""
                 'checkout':           ['Fazendo Check-out...', '#e67e22', AUVO_ETAPAS_PROGRESSO['checkout']],
             };
 
+            const limparCancelarFluxo = mostrarCancelamentoProcesso(botaoOut, flowKey, 'Criando e finalizando atendimento', () => resetBotaoCheckout(botaoOut));
             iniciarPolling(flowKey, 1000, (s) => {
+                if (tratarCancelado(s, botaoOut, limparCancelarFluxo, () => resetBotaoCheckout(botaoOut), 'Processo cancelado.')) return true;
                 if (s.status === 'auvo_instavel') {
+                    limparCancelarFluxo();
                     setBotao(botaoOut, '⚠️ Auvo com Instabilidade', '#c0392b', false);
                     mostrarNotificacao('O Auvo ficou instável durante o processo. Verifique e tente novamente.', 'erro');
                     resetBotaoCheckout(botaoOut);
                     return true;
+                }
+                if (s.status === 'aguardando_confirmacao_textos') {
+                    confirmarTextosFluxo(
+                        {
+                            flow_key: flowKey,
+                            descricao: s.descricao,
+                            relato: s.relato,
+                        },
+                        botaoOut
+                    );
+                    return false;
+                }
+                if (s.status === 'aguardando_confirmacao_relato') {
+                    setBotao(botaoOut, 'Conferir relato...', '#8e44ad', true, AUVO_ETAPAS_PROGRESSO['relato_ok']);
+                    confirmarRelatoCheckout(
+                        {
+                            task_id: s.task_id,
+                            status_key: s.status_key,
+                            flow_key: flowKey,
+                            relato: s.relato,
+                            data: s.data,
+                            hora: s.hora,
+                            cancel_key: flowKey,
+                            verificacao_equipamento: s.verificacao_equipamento || null,
+                        },
+                        botaoOut
+                    );
+                    return false;
                 }
                 if (etapas[s.status]) {
                     const [label, cor, pct] = etapas[s.status];
                     setBotao(botaoOut, label, cor, true, pct);
                 }
                 if (s.status === 'done') {
+                    limparCancelarFluxo();
                     const tid = s.task_id || '';
                     setBotao(botaoOut, `Atendimento finalizado #${tid}`, '#27ae60', true);
                     mostrarNotificacao(`Atendimento criado, check-in e check-out concluídos. Task #${tid}.`, 'sucesso');
@@ -3946,6 +6594,26 @@ SCRIPT_BOTAO = r"""
             ? spanEmpresa.nextElementSibling.innerText : 'Desconhecida';
     }
 
+    function obterReferenciaAtendimentoAtual() {
+        return Array.from(document.querySelectorAll('span'))
+            .find(el => el.textContent.trim().includes('Protocolo')) || null;
+    }
+
+    function obterSistemaAtual(referencia) {
+    const seletor = 'div.p-chip-text[data-pc-section="label"], .p-chip-text[data-pc-section="label"]';
+    const textoChip = (el) => (el?.innerText || el?.textContent || '').trim();
+    const ehSistema = (el) => {
+        const texto = textoChip(el);
+        return texto && !/^(suporte|interno|externo)$/i.test(texto);
+    };
+
+    const chips = Array.from(document.querySelectorAll(seletor))
+        .filter(el => !el.closest('article.attendance_item'))
+        .filter(ehSistema);
+
+    if (chips.length === 0) return '';
+    return chips.map(textoChip).join(' | ');
+}
     function abrirModalPausa(aoConfirmar, aoCancelar) {
         const existente = document.getElementById('auvo-modal-pausa');
         if (existente) existente.remove();
@@ -4222,15 +6890,18 @@ SCRIPT_BOTAO = r"""
 
     function iniciarFluxoDespausa(botaoDespausa, textoEmpresa, dadosDespausa) {
         bloquearAcaoOposta('despausa');
+        const cancelKeyDespausaInicial = criarChaveCancelamento('despausa');
+        mostrarCancelamentoProcesso(botaoDespausa, cancelKeyDespausaInicial, 'Fim da pausa', () => resetBotaoDespausa(botaoDespausa));
         setBotao(botaoDespausa, 'Finalizando pausa...', '#16a085', true, AUVO_ETAPAS_PROGRESSO['iniciando_pausa']);
 
         fetch('http://localhost:8765/auvo-despausa', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ empresa: textoEmpresa, ...(dadosDespausa || {}) }),
+            body: JSON.stringify({ empresa: textoEmpresa, ...(dadosDespausa || {}), cancel_key: cancelKeyDespausaInicial }),
         })
         .then(r => r.json())
         .then(data => {
+            if (tratarRespostaCancelada(data, botaoDespausa, () => resetBotaoDespausa(botaoDespausa), 'Fim da pausa cancelado.')) return;
             if (data.status === 'multiplas_empresas') {
                 setBotao(botaoDespausa, 'Fim da pausa', '#16a085', false);
                 mostrarSeletorEmpresas(
@@ -4262,8 +6933,11 @@ SCRIPT_BOTAO = r"""
             if (data.status !== 'ok') throw new Error(data.mensagem || 'Erro desconhecido');
 
             setBotao(botaoDespausa, 'Abrindo task...', '#16a085', true, AUVO_ETAPAS_PROGRESSO['abrindo_task']);
+            const limparCancelarStatus = mostrarCancelamentoProcesso(botaoDespausa, data.status_key, `Processo Task #${data.task_id}`, () => resetBotaoDespausa(botaoDespausa));
             iniciarPolling(data.status_key, 1000, (s) => {
+                if (tratarCancelado(s, botaoDespausa, limparCancelarStatus, () => resetBotaoDespausa(botaoDespausa), 'Fim da pausa cancelado.')) return true;
                 if (s.status === 'auvo_instavel') {
+                    limparCancelarStatus();
                     setBotao(botaoDespausa, 'Auvo com Instabilidade', '#c0392b', false);
                     mostrarNotificacao('O Auvo ficou instável durante o fim da pausa. Verifique e tente novamente.', 'erro');
                     resetBotaoDespausa(botaoDespausa);
@@ -4279,12 +6953,14 @@ SCRIPT_BOTAO = r"""
                     setBotao(botaoDespausa, 'Salvando fim...', '#16a085', true, AUVO_ETAPAS_PROGRESSO['lancando_despausa']);
                 }
                 if (s.status === 'erro') {
+                    limparCancelarStatus();
                     setBotao(botaoDespausa, 'Erro!', '#e74c3c', false);
                     mostrarNotificacao(s.mensagem || 'Erro ao lançar fim da pausa.', 'erro');
                     resetBotaoDespausa(botaoDespausa);
                     return true;
                 }
                 if (s.status === 'done') {
+                    limparCancelarStatus();
                     setBotao(botaoDespausa, `Fim salvo #${data.task_id}`, '#27ae60', true);
                     mostrarNotificacao(`Fim da pausa salvo. Task #${data.task_id}.`, 'sucesso');
                     resetBotaoDespausa(botaoDespausa);
@@ -4301,15 +6977,18 @@ SCRIPT_BOTAO = r"""
     }
     function iniciarFluxoPausa(botaoPausa, textoEmpresa, dadosPausa) {
         bloquearAcaoOposta('pausa');
+        const cancelKeyPausaInicial = criarChaveCancelamento('pausa');
+        mostrarCancelamentoProcesso(botaoPausa, cancelKeyPausaInicial, 'Pausa', () => resetBotaoPausa(botaoPausa));
         setBotao(botaoPausa, 'Iniciando pausa...', '#8e44ad', true, AUVO_ETAPAS_PROGRESSO['iniciando_pausa']);
 
         fetch('http://localhost:8765/auvo-pausa', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ empresa: textoEmpresa, ...(dadosPausa || {}) }),
+            body: JSON.stringify({ empresa: textoEmpresa, ...(dadosPausa || {}), cancel_key: cancelKeyPausaInicial }),
         })
         .then(r => r.json())
         .then(data => {
+            if (tratarRespostaCancelada(data, botaoPausa, () => resetBotaoPausa(botaoPausa), 'Pausa cancelada.')) return;
             if (data.status === 'multiplas_empresas') {
                 setBotao(botaoPausa, 'Iniciar pausa', '#8e44ad', false);
                 mostrarSeletorEmpresas(
@@ -4347,8 +7026,11 @@ SCRIPT_BOTAO = r"""
             if (data.status !== 'ok') throw new Error(data.mensagem || 'Erro desconhecido');
 
             setBotao(botaoPausa, 'Abrindo task...', '#8e44ad', true, AUVO_ETAPAS_PROGRESSO['abrindo_task']);
+            const limparCancelarStatus = mostrarCancelamentoProcesso(botaoPausa, data.status_key, `Processo Task #${data.task_id}`, () => resetBotaoPausa(botaoPausa));
             iniciarPolling(data.status_key, 1000, (s) => {
+                if (tratarCancelado(s, botaoPausa, limparCancelarStatus, () => resetBotaoPausa(botaoPausa), 'Pausa cancelada.')) return true;
                 if (s.status === 'auvo_instavel') {
+                    limparCancelarStatus();
                     setBotao(botaoPausa, 'Auvo com Instabilidade', '#c0392b', false);
                     mostrarNotificacao('O Auvo ficou instável durante a pausa. Verifique e tente novamente.', 'erro');
                     resetBotaoPausa(botaoPausa);
@@ -4364,12 +7046,14 @@ SCRIPT_BOTAO = r"""
                     setBotao(botaoPausa, 'Lançando pausa...', '#8e44ad', true, AUVO_ETAPAS_PROGRESSO['lancando_pausa']);
                 }
                 if (s.status === 'erro') {
+                    limparCancelarStatus();
                     setBotao(botaoPausa, 'Erro!', '#e74c3c', false);
                     mostrarNotificacao(s.mensagem || 'Erro ao lançar início da pausa.', 'erro');
                     resetBotaoPausa(botaoPausa);
                     return true;
                 }
                 if (s.status === 'done') {
+                    limparCancelarStatus();
                     setBotao(botaoPausa, `Pausa salva #${data.task_id}`, '#27ae60', true);
                     mostrarNotificacao(`Início da pausa salvo. Task #${data.task_id}.`, 'sucesso');
                     resetBotaoPausa(botaoPausa);
@@ -4385,24 +7069,27 @@ SCRIPT_BOTAO = r"""
         });
     }
     // ── Inserção dos botões ───────────────────────────────────────────────
-    function iniciarFluxoCheckin(botao, textoEmpresa, codigoCliente, inicioEscolhido) {
+    function iniciarFluxoCheckin(botao, textoEmpresa, codigoCliente, inicioEscolhido, sistemaCliente, opcoes = {}) {
         bloquearAcaoOposta('checkin');
+        const cancelKeyCheckinInicial = criarChaveCancelamento('checkin');
+        mostrarCancelamentoProcesso(botao, cancelKeyCheckinInicial, 'Check-in', () => resetBotaoCheckin(botao));
         setBotao(botao, 'Analisando chat...', '#2ecc71', true, AUVO_ETAPAS_PROGRESSO['analisando']);
 
         fetch('http://localhost:8765/auvo', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ empresa: textoEmpresa, codigo_cliente: codigoCliente || null, inicio_escolhido: inicioEscolhido || null }),
+            body: JSON.stringify({ empresa: textoEmpresa, codigo_cliente: codigoCliente || null, inicio_escolhido: inicioEscolhido || null, sistema: sistemaCliente || null, continuar_sem_contrato: !!opcoes.continuarSemContrato, continuar_sem_segmento: !!opcoes.continuarSemSegmento, cancel_key: cancelKeyCheckinInicial }),
         })
         .then(r => r.json())
         .then(data => {
+            if (tratarRespostaCancelada(data, botao, () => resetBotaoCheckin(botao), 'Check-in cancelado.')) return;
             if (data.status === 'multiplas_empresas') {
                 setBotao(botao, 'Lancar no Auvo', '#2ecc71', false);
                 mostrarSeletorEmpresas(
                     data.empresas,
                     textoEmpresa,
                     botao,
-                    (empresaEscolhida) => iniciarFluxoCheckin(botao, textoEmpresa, empresaEscolhida.codigo),
+                    (empresaEscolhida) => iniciarFluxoCheckin(botao, textoEmpresa, empresaEscolhida.codigo, null, sistemaCliente),
                     () => resetBotaoCheckin(botao)
                 );
                 return;
@@ -4413,9 +7100,15 @@ SCRIPT_BOTAO = r"""
                 mostrarSeletorInicios(
                     data.inicios,
                     botao,
-                    (inicioEscolhido) => iniciarFluxoCheckin(botao, textoEmpresa, data.codigo_cliente || codigoCliente, inicioEscolhido),
+                    (inicioEscolhido) => iniciarFluxoCheckin(botao, textoEmpresa, data.codigo_cliente || codigoCliente, inicioEscolhido, sistemaCliente),
                     () => resetBotaoCheckin(botao)
                 );
+                return;
+            }
+            if (data.status === 'cliente_sem_segmento' || data.status === 'cliente_sem_contrato') {
+                const opcaoContinuar = data.status === 'cliente_sem_segmento' ? { continuarSemSegmento: true } : { continuarSemContrato: true };
+                setBotao(botao, data.status === 'cliente_sem_segmento' ? 'Cliente sem segmento' : 'Cliente sem contrato', '#f39c12', false);
+                mostrarConfirmacaoSegmento(data, botao, () => iniciarFluxoCheckin(botao, textoEmpresa, data.codigo_cliente || codigoCliente, inicioEscolhido, sistemaCliente, opcaoContinuar), () => resetBotaoCheckin(botao));
                 return;
             }
             if (data.status === 'auvo_instavel') {
@@ -4429,14 +7122,19 @@ SCRIPT_BOTAO = r"""
 
             setBotao(botao, `Task #${data.task_id} - Fazendo Check-in...`, '#3498db', true, AUVO_ETAPAS_PROGRESSO['fazendo_checkin']);
 
-            iniciarPolling(String(data.task_id), 1000, (s) => {
+            const chaveCheckin = String(data.task_id);
+            const limparCancelarCheckin = mostrarCancelamentoProcesso(botao, chaveCheckin, `Check-in Task #${data.task_id}`, () => resetBotaoCheckin(botao));
+            iniciarPolling(chaveCheckin, 1000, (s) => {
+                if (tratarCancelado(s, botao, limparCancelarCheckin, () => resetBotaoCheckin(botao), 'Check-in cancelado.')) return true;
                 if (s.status === 'auvo_instavel') {
+                    limparCancelarCheckin();
                     setBotao(botao, 'Auvo com Instabilidade', '#c0392b', false);
                     mostrarNotificacao('O Auvo ficou instavel durante o check-in. Verifique a task e tente o check-in manualmente se necessario.', 'erro');
                     resetBotaoCheckin(botao);
                     return true;
                 }
                 if (s.status === 'done') {
+                    limparCancelarCheckin();
                     setBotao(botao, `Check-in salvo #${data.task_id}`, '#27ae60', true);
                     mostrarNotificacao(`Check-in concluído com sucesso. Task #${data.task_id} - ${data.empresa || textoEmpresa}.`, 'sucesso');
                     resetBotaoCheckin(botao);
@@ -4454,8 +7152,7 @@ SCRIPT_BOTAO = r"""
     function verificarEInserir() {
         garantirEstiloBotoesAuvo();
         if (document.getElementById('botao-auvo')) return;
-        const spanProtocolo = Array.from(document.querySelectorAll('span'))
-            .find(el => el.textContent.trim().includes('Protocolo'));
+        const spanProtocolo = obterReferenciaAtendimentoAtual();
         if (!spanProtocolo) return;
 
         // --- BOTÃO CHECK-IN ---
@@ -4475,12 +7172,11 @@ SCRIPT_BOTAO = r"""
         setBotao(botao, 'Lançar atendimento no Auvo', '#2ecc71', false);
 
         botao.onclick = () => {
+            if (botao.dataset.auvoCancelKey) { processarCancelamentoBotao(botao); return; }
             if (botao.disabled) return;
-            const spans       = Array.from(document.querySelectorAll('span'));
-            const spanEmpresa = spans.find(el => el.textContent.trim() === 'Empresa');
-            const textoEmpresa = spanEmpresa && spanEmpresa.nextElementSibling
-                ? spanEmpresa.nextElementSibling.innerText : 'Desconhecida';
-            iniciarFluxoCheckin(botao, textoEmpresa);
+            const textoEmpresa = obterDadosEmpresaAtual();
+            const sistemaCliente = obterSistemaAtual(obterReferenciaAtendimentoAtual());
+            iniciarFluxoCheckin(botao, textoEmpresa, null, null, sistemaCliente);
         };
         // --- BOTÃO CHECK-OUT ---
         const botaoOut = document.createElement('button');
@@ -4499,14 +7195,11 @@ SCRIPT_BOTAO = r"""
         setBotao(botaoOut, 'Fazer check-out', '#e67e22', false);
 
         botaoOut.onclick = () => {
+            if (botaoOut.dataset.auvoCancelKey) { processarCancelamentoBotao(botaoOut); return; }
             if (botaoOut.disabled) return;
-
-            const spans       = Array.from(document.querySelectorAll('span'));
-            const spanEmpresa = spans.find(el => el.textContent.trim() === 'Empresa');
-            const textoEmpresa = spanEmpresa && spanEmpresa.nextElementSibling
-                ? spanEmpresa.nextElementSibling.innerText : 'Desconhecida';
-
-            iniciarFluxoCheckout(botaoOut, textoEmpresa);
+            const textoEmpresa = obterDadosEmpresaAtual();
+            const sistemaCliente = obterSistemaAtual(obterReferenciaAtendimentoAtual());
+            iniciarFluxoCheckout(botaoOut, textoEmpresa, null, sistemaCliente);
         };
 
         // --- BOTÃO PAUSA ---
@@ -4526,6 +7219,7 @@ SCRIPT_BOTAO = r"""
         setBotao(botaoPausa, 'Iniciar pausa', '#8e44ad', false);
 
         botaoPausa.onclick = () => {
+            if (botaoPausa.dataset.auvoCancelKey) { processarCancelamentoBotao(botaoPausa); return; }
             if (botaoPausa.disabled) return;
             const textoEmpresa = obterDadosEmpresaAtual();
             abrirModalPausa(
@@ -4551,6 +7245,7 @@ SCRIPT_BOTAO = r"""
         setBotao(botaoDespausa, 'Fim da pausa', '#16a085', false);
 
         botaoDespausa.onclick = () => {
+            if (botaoDespausa.dataset.auvoCancelKey) { processarCancelamentoBotao(botaoDespausa); return; }
             if (botaoDespausa.disabled) return;
             const textoEmpresa = obterDadosEmpresaAtual();
             abrirModalDespausa(

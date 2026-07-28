@@ -1,0 +1,11 @@
+pandas
+requests
+urllib3
+playwright
+pyperclip
+supabase
+python-dotenv
+pystray
+Pillow
+gspread
+google-auth
