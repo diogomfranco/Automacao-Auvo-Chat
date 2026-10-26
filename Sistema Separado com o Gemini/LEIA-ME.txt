@@ -1,0 +1,74 @@
+SISTEMA AUVO — PLAYWRIGHT NO SERVIDOR / MULTIUSUÁRIO
+
+ARQUITETURA
+
+PC DO ATENDENTE
+- cliente.py -> SistemaAuvo.exe.
+- Continua controlando o Speakr pelo Chrome local, via CDP em localhost:9222.
+- O check-in, o check-out e o fluxo combinado são enviados ao servidor 192.168.18.30.
+- O PC não envia a senha do Auvo para o servidor; o servidor resolve a credencial no Supabase.
+
+SERVIDOR 192.168.18.30
+- servidor.py -> AuvoPlaywrightServer.exe.
+- Porta HTTP: 8766.
+- Todas as páginas Playwright usam SEMPRE o Microsoft Edge instalado, com headless=False.
+- No Auvo o navegador usa as MESMAS restrições do código que já funcionava (bloqueia imagem, CSS, fontes, mídia e 'other'); no Gemini carrega CSS/scripts normalmente. A troca é automática pelo site, na mesma janela.
+- Gemini e Auvo usam UMA única janela: abas/janelas extras do mesmo Edge são fechadas.
+- A janela abre em estado normal (posição 40,40, 1280x860) e NUNCA fica minimizada: se o Windows a abrir minimizada, o programa a restaura via CDP antes de cada clique importante.
+  (Não use a posição -32000,-32000: é a coordenada do Windows para janela minimizada e o Chromium passa a tratar a página como oculta, o que impede os cliques do Playwright.)
+- Não é preciso .bat nem variável de ambiente: AUVO_LANCAMENTO_UNICO já vem LIGADO por padrão. Para desligar (raro): AUVO_LANCAMENTO_UNICO=0.
+- O servidor precisa permanecer em uma sessão interativa do Windows. Não execute como serviço sem sessão gráfica quando for usar o Gemini web.
+- O Microsoft Edge precisa estar instalado no servidor. O pacote não inclui Chromium para esse uso.
+- O servidor cria um state.json por atendente em sessions/usuario_<id_da_tabela>/state.json.
+
+CONCORRÊNCIA
+- Há um lock por usuário do Auvo: duas operações do mesmo atendente são executadas em sequência para proteger a sessão.
+- Atendentes diferentes podem executar jobs Playwright em paralelo. Cada job cria seu próprio processo Edge/contexto e sua própria página, evitando compartilhar a mesma página entre usuários.
+- O número de jobs realmente simultâneos depende da memória/CPU do servidor e dos limites/rate limits do Gemini e do Auvo. Faça testes com 2 atendentes antes de ampliar.
+- Se vários atendentes utilizarem uma mesma conta Google no Gemini, podem ocorrer limites temporários de uso/login; prefira uma configuração autenticada por atendente quando aplicável.
+
+SUPABASE
+
+A tabela usuarios_auvo deve possuir:
+- id       (chave primária/identificador único)
+- usuario  (login Auvo)
+- senha    (senha Auvo)
+- nome     (nome usado na seleção do programa; deve corresponder ao nome salvo na tabela)
+
+A tabela credenciais_auvo continua sendo utilizada para api_key/api_token da integração com a API do Auvo.
+
+O arquivo config_supabase.json deve estar disponível no caminho configurado pelo programa e conter as credenciais da conta de automação. Restrinja as permissões desse arquivo. A conta usada precisa ter acesso de leitura às tabelas usuarios_auvo e credenciais_auvo.
+
+MODO GEMINI + AUVO NA MESMA SESSÃO
+- Ligado por padrão (AUVO_LANCAMENTO_UNICO=1 já é o valor padrão no código).
+- AUVO_LANCAMENTO_UNICO_ESPERA pode controlar o tempo de espera configurado para o fluxo.
+- O fluxo usa a mesma página Playwright do Gemini e depois do Auvo, navegando entre os dois sites.
+- A sessão Google do Gemini precisa estar autenticada. O sistema usa SOMENTE o Gemini web (FreeLLM removido); se o Gemini pedir login ou não responder, o texto padrão do código é usado. Confira os logs.
+
+DESCRIÇÃO DO AGENDAMENTO
+- O botão Agendamentos também gera a descrição pelo Gemini web do servidor (job modo "texto" em /playwright/lancar). Não há mais FreeLLM nem API de IA: se o Gemini não responder, usa o texto padrão do código.
+- Treinamento (tipo 205918) continua com texto fixo; identificação do contato pela IA também usa o Gemini do servidor.
+
+DIAGNÓSTICO DE CHECK-IN
+- O servidor imprime etapas do check-in no console para identificar onde parou.
+- Capturas de erro são gravadas ao lado do state.json do atendente, dentro da pasta sessions.
+- Se o clique em Salvar for enviado, mas o Auvo não confirmar visualmente a gravação, o código não repetirá automaticamente o check-in: isso evita duplicidades. Confira a tarefa no Auvo antes de iniciar nova tentativa.
+- A janela do Edge já fica visível no servidor; os logs mostram cada etapa e qual candidato do botão Editar foi usado.
+- Se o Salvar do check-in/check-out for enviado sem confirmação, nada é repetido automaticamente (evita lançamento duplicado).
+
+BUILD
+- Faça a compilação em Windows.
+- Instale as dependências de requirements-build.txt.
+- Rode build_client.bat e build_server.bat.
+- Os executáveis serão criados em dist\.
+- O servidor utiliza o Edge instalado na máquina de destino. Não é necessário instalar Chromium pelo comando `playwright install chromium` para esse caminho.
+
+REDE E SEGURANÇA
+- Libere TCP 8766 no Firewall do Windows apenas para a rede interna autorizada.
+- O cliente utiliza http://192.168.18.30:8766.
+- Defina um token forte via PLAYWRIGHT_SERVER_TOKEN, igual no servidor e nos clientes. Não use o token-padrão em produção.
+- O HTTP simples não criptografa os dados em trânsito; mantenha a rede restrita ou proteja o tráfego com VPN/HTTPS.
+
+OBSERVAÇÃO
+- O script de build utiliza sistema_auvo.py; este arquivo foi sincronizado com sistema_auvo_corrigido.py.
+- Pausa/despausa e os outros fluxos Playwright continuam disponíveis nos caminhos legados.

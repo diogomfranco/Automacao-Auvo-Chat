@@ -1,0 +1,94 @@
+SISTEMA AUVO — PLAYWRIGHT NO SERVIDOR / MULTIUSUÁRIO
+
+ARQUITETURA
+
+PC DO ATENDENTE
+- cliente.py -> SistemaAuvo.exe
+- Continua controlando o Speakr via CDP em localhost:9222.
+- Continua lendo o chat, usando IA e criando/consultando tasks pela API do Auvo.
+- Check-in, check-out e o fluxo combinado são enviados ao servidor 192.168.18.30.
+- O PC NÃO envia a senha do Auvo para o servidor.
+- O usuário selecionado no programa é identificado por nome e usado para localizar
+  a credencial correspondente em usuarios_auvo.
+
+SERVIDOR 192.168.18.30
+- servidor.py -> AuvoPlaywrightServer.exe
+- Porta HTTP: 8766.
+- Executa Playwright headless.
+- Para cada atendente é criado um state.json separado, em:
+  sessions/usuario_<id_da_tabela>/state.json
+- Existe um lock por atendente: duas operações do MESMO usuário são executadas
+  em sequência para proteger a sessão; usuários DIFERENTES podem executar
+  Playwright simultaneamente.
+- Os jobs recebem IDs remotos únicos, evitando colisão quando vários PCs
+  solicitam operações ao mesmo tempo.
+
+SUPABASE
+
+A tabela usuarios_auvo deve possuir as colunas:
+- id       (chave primária / identificador único da linha)
+- usuario  (login do Auvo)
+- senha    (senha do Auvo)
+- nome     (nome do atendente usado pelo programa)
+
+Exemplo:
+1 | diogo.minas   | ******** | Diogo
+2 | larissa.minas | ******** | Larissa
+
+O nome em usuarios_auvo precisa corresponder ao nome mostrado na seleção do
+programa. Mantenha apenas um cadastro por nome.
+
+A tabela credenciais_auvo continua sendo usada apenas para api_key/api_token
+da integração com a API do Auvo.
+
+RLS
+- A conta usada em config_supabase.json precisa ter permissão de leitura em
+  usuarios_auvo e credenciais_auvo.
+- A senha de cada usuário fica somente no Supabase e no state/sessão local do
+  servidor quando o Auvo já tiver autenticado.
+
+CONCORRÊNCIA
+
+Exemplo com três atendentes:
+
+João   -> sessão João   -> Playwright ─┐
+Maria  -> sessão Maria  -> Playwright ├─ executam em paralelo
+Pedro  -> sessão Pedro  -> Playwright ┘
+
+Se João clicar duas vezes antes de a primeira operação terminar:
+João job 1 -> executa
+João job 2 -> aguarda o lock de João
+
+Isso evita que duas operações do mesmo usuário alterem o mesmo state.json ao
+mesmo tempo, sem bloquear os demais atendentes.
+
+SEGURANÇA DA COMUNICAÇÃO
+- O acesso aos endpoints remotos continua protegido por X-Playwright-Token.
+- O PC envia apenas nome/id do atendente, task, datas/horas e dados da operação.
+- A senha é buscada pelo servidor diretamente na tabela usuarios_auvo.
+
+BUILD
+- Faça a compilação em Windows.
+- Instale as dependências de requirements-build.txt.
+- Rode build_client.bat e build_server.bat.
+- Os executáveis serão criados em dist\.
+- build_server.bat instala o Chromium do Playwright na máquina de compilação e
+  o inclui no pacote do servidor; não é necessário instalar Python/Playwright
+  no servidor depois da cópia do EXE.
+
+REDE
+- Libere TCP 8766 no Firewall do Windows do servidor apenas para a rede interna.
+- O cliente usa http://192.168.18.30:8766.
+
+OBSERVAÇÃO
+- O pacote mantém pausa/despausa no fluxo local, usando a credencial do atendente
+  obtida de usuarios_auvo.
+
+
+CORREÇÃO DA COMPILAÇÃO DO SERVIDOR
+
+Se a versão anterior apresentava:
+ValueError: too many values to unpack (expected 2)
+na linha que adicionava Tree(...), esta versão já está corrigida. O spec agora
+registra a pasta ms-playwright como uma entrada de datas no formato aceito pelo
+PyInstaller.
